@@ -1,276 +1,288 @@
 """
-Status and Dashboard View for DNSCrypt UI.
-Displays service status, latency tester, quick toggles, and systemd-resolved conflict detector.
+Dashboard for DNSCrypt UI: service state, system DNS protection (leak check
+and one-click fix), a resolution test, and privacy requirements.
 """
+
+import os
 
 import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Gtk, Adw, GLib
+from gi.repository import Adw, Gtk
 
-from ..backend.service_manager import ServiceManager
-from ..backend.config_manager import ConfigManager
+from ..backend import resolver_db
+from ..backend.service_manager import probe_target
+from ..util import run_in_thread
+
+RESOLVED_DROPIN = "/etc/systemd/resolved.conf.d/zz-dnscrypt-ui.conf"
 
 
 class StatusView(Adw.PreferencesPage):
-    def __init__(self, service_mgr: ServiceManager, config_mgr: ConfigManager, on_change_cb):
+    def __init__(self, win):
         super().__init__()
-        self.service_mgr = service_mgr
-        self.config_mgr = config_mgr
-        self.on_change_cb = on_change_cb
-
-        self.set_title("Dashboard")
-        self.set_icon_name("network-wired-symbolic")
-
+        self.win = win
+        self.cfg = win.config_mgr
+        self._loading = False
         self._build_ui()
-        self.refresh_status()
+        self.reload()
 
     def _build_ui(self):
-        # 1. Main Service Status Group
-        self.status_group = Adw.PreferencesGroup()
-        self.status_group.set_title("Service Status")
-        self.status_group.set_description("Status of the local dnscrypt-proxy daemon")
-        self.add(self.status_group)
+        # Service
+        group = Adw.PreferencesGroup(title="Service")
+        self.add(group)
 
-        # Status Row
-        self.status_row = Adw.ActionRow()
-        self.status_row.set_title("Checking status...")
-        self.status_row.set_subtitle("Reading systemd unit state")
-        self.status_icon = Gtk.Image.new_from_icon_name("network-transmit-receive-symbolic")
-        self.status_icon.set_pixel_size(28)
+        self.status_row = Adw.ActionRow(title="Checking status…")
+        self.status_icon = Gtk.Image.new_from_icon_name("content-loading-symbolic")
+        self.status_icon.set_pixel_size(24)
         self.status_row.add_prefix(self.status_icon)
-
-        # Controls in Status Row
-        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        btn_box.set_valign(Gtk.Align.CENTER)
-
-        self.btn_start = Gtk.Button(label="Start")
-        self.btn_start.add_css_class("suggested-action")
-        self.btn_start.connect("clicked", self._on_start_clicked)
-
-        self.btn_stop = Gtk.Button(label="Stop")
-        self.btn_stop.add_css_class("destructive-action")
-        self.btn_stop.connect("clicked", self._on_stop_clicked)
-
-        self.btn_restart = Gtk.Button(label="Restart")
+        self.btn_restart = Gtk.Button(label="Restart", valign=Gtk.Align.CENTER)
         self.btn_restart.connect("clicked", self._on_restart_clicked)
+        self.status_row.add_suffix(self.btn_restart)
+        group.add(self.status_row)
 
-        btn_box.append(self.btn_start)
-        btn_box.append(self.btn_stop)
-        btn_box.append(self.btn_restart)
-        self.status_row.add_suffix(btn_box)
+        # System DNS protection
+        group = Adw.PreferencesGroup(
+            title="System DNS",
+            description="Whether applications on this computer actually resolve names through dnscrypt-proxy",
+        )
+        self.add(group)
 
-        self.status_group.add(self.status_row)
+        self.routing_row = Adw.ExpanderRow(title="Checking…")
+        self.routing_icon = Gtk.Image.new_from_icon_name("content-loading-symbolic")
+        self.routing_icon.set_pixel_size(24)
+        self.routing_row.add_prefix(self.routing_icon)
+        self.btn_fix = Gtk.Button(label="Fix", valign=Gtk.Align.CENTER)
+        self.btn_fix.add_css_class("suggested-action")
+        self.btn_fix.connect("clicked", self._on_fix_clicked)
+        self.routing_row.add_suffix(self.btn_fix)
+        self._problem_rows = []
+        group.add(self.routing_row)
 
-        # 2. Port 53 / Fedora Conflict Banner Row
-        self.conflict_row = Adw.ActionRow()
-        self.conflict_row.set_title("Port 53 Conflict Detected")
-        self.conflict_row.set_subtitle("systemd-resolved is currently listening on port 53")
-        warn_icon = Gtk.Image.new_from_icon_name("dialog-warning-symbolic")
-        self.conflict_row.add_prefix(warn_icon)
-        btn_fix = Gtk.Button(label="How to Fix")
-        btn_fix.set_valign(Gtk.Align.CENTER)
-        btn_fix.connect("clicked", self._show_conflict_dialog)
-        self.conflict_row.add_suffix(btn_fix)
-        self.status_group.add(self.conflict_row)
-        self.conflict_row.set_visible(False)
+        self.undo_row = Adw.ActionRow(
+            title="Undo DNS routing",
+            subtitle="Remove the systemd-resolved and NetworkManager settings made by DNSCrypt UI",
+        )
+        btn_undo = Gtk.Button(label="Undo", valign=Gtk.Align.CENTER)
+        btn_undo.connect("clicked", self._on_undo_clicked)
+        self.undo_row.add_suffix(btn_undo)
+        group.add(self.undo_row)
 
-        # 3. DNS Benchmark / Query Test Group
-        self.test_group = Adw.PreferencesGroup()
-        self.test_group.set_title("DNS Resolution Test")
-        self.test_group.set_description("Verify query resolution and measure latency through 127.0.0.1:53")
-        self.add(self.test_group)
-
-        self.test_row = Adw.ActionRow()
-        self.test_row.set_title("Query Test (cloudflare.com)")
-        self.test_row.set_subtitle("Click 'Run Test' to benchmark resolution")
-        test_icon = Gtk.Image.new_from_icon_name("speedometer-symbolic")
-        self.test_row.add_prefix(test_icon)
-
-        self.btn_test = Gtk.Button(label="Run Test")
-        self.btn_test.set_valign(Gtk.Align.CENTER)
+        # Test
+        group = Adw.PreferencesGroup(title="Resolution Test")
+        self.add(group)
+        self.test_row = Adw.ActionRow(title="Lookup", subtitle="Resolve cloudflare.com through dnscrypt-proxy")
+        self.upstream_row = Adw.ActionRow(
+            title="Upstream round trip",
+            subtitle="Uncached query, measures the encrypted path to your resolvers",
+        )
+        self.btn_test = Gtk.Button(label="Run Test", valign=Gtk.Align.CENTER)
         self.btn_test.connect("clicked", self._on_test_clicked)
         self.test_row.add_suffix(self.btn_test)
+        group.add(self.test_row)
+        group.add(self.upstream_row)
 
-        self.test_group.add(self.test_row)
+        # Summary
+        group = Adw.PreferencesGroup(title="Summary")
+        self.add(group)
+        self.resolvers_row = Adw.ActionRow(title="Upstream resolvers")
+        self.lbl_resolvers = Gtk.Label(valign=Gtk.Align.CENTER, css_classes=["dns-stat-pill"])
+        self.resolvers_row.add_suffix(self.lbl_resolvers)
+        group.add(self.resolvers_row)
+        self.rules_row = Adw.ActionRow(title="Domain rules", subtitle="Per-domain forwarding (plain DNS)")
+        self.lbl_rules = Gtk.Label(valign=Gtk.Align.CENTER, css_classes=["dns-stat-pill"])
+        self.rules_row.add_suffix(self.lbl_rules)
+        group.add(self.rules_row)
 
-        # 4. Summary & Quick Stats Group
-        self.stats_group = Adw.PreferencesGroup()
-        self.stats_group.set_title("Summary and Rules")
-        self.add(self.stats_group)
+        # Requirements
+        group = Adw.PreferencesGroup(
+            title="Resolver Requirements",
+            description="Selected resolvers that do not meet these are skipped by dnscrypt-proxy",
+        )
+        self.add(group)
+        self.dnssec_row = Adw.SwitchRow(title="Require DNSSEC", subtitle="Only use resolvers that validate DNSSEC")
+        self.nolog_row = Adw.SwitchRow(title="Require no-log", subtitle="Only use resolvers that promise not to log queries")
+        self.nofilter_row = Adw.SwitchRow(
+            title="Require no-filter",
+            subtitle="Only use resolvers that do not block anything. Turn off to use malware or ad blocking resolvers",
+        )
+        for row, attr in ((self.dnssec_row, "require_dnssec"), (self.nolog_row, "require_nolog"), (self.nofilter_row, "require_nofilter")):
+            row.connect("notify::active", self._on_requirement_toggled, attr)
+            group.add(row)
 
-        # Active Upstream Count Row
-        self.resolvers_stat_row = Adw.ActionRow()
-        self.resolvers_stat_row.set_title("Active Upstream Resolvers")
-        self.resolvers_stat_row.set_subtitle("DoH and DNSCrypt servers configured")
-        res_icon = Gtk.Image.new_from_icon_name("cloud-symbolic")
-        self.resolvers_stat_row.add_prefix(res_icon)
-        self.lbl_resolvers_count = Gtk.Label(label="0")
-        self.lbl_resolvers_count.add_css_class("heading")
-        self.lbl_resolvers_count.add_css_class("dns-stat-pill")
-        self.lbl_resolvers_count.set_valign(Gtk.Align.CENTER)
-        self.resolvers_stat_row.add_suffix(self.lbl_resolvers_count)
-        self.stats_group.add(self.resolvers_stat_row)
+    # Updates from the window
 
-        # Split DNS Rules Count Row
-        self.rules_stat_row = Adw.ActionRow()
-        self.rules_stat_row.set_title("Split-DNS Domain Rules")
-        self.rules_stat_row.set_subtitle("Custom per-domain forwarding rules active")
-        rule_icon = Gtk.Image.new_from_icon_name("view-list-bullet-symbolic")
-        self.rules_stat_row.add_prefix(rule_icon)
-        self.lbl_rules_count = Gtk.Label(label="0")
-        self.lbl_rules_count.add_css_class("heading")
-        self.lbl_rules_count.add_css_class("dns-stat-pill")
-        self.lbl_rules_count.set_valign(Gtk.Align.CENTER)
-        self.rules_stat_row.add_suffix(self.lbl_rules_count)
-        self.stats_group.add(self.rules_stat_row)
+    def reload(self):
+        self._loading = True
+        try:
+            self.dnssec_row.set_active(self.cfg.require_dnssec)
+            self.nolog_row.set_active(self.cfg.require_nolog)
+            self.nofilter_row.set_active(self.cfg.require_nofilter)
+        finally:
+            self._loading = False
+        self.update_summary()
 
-        # DNSSEC & Privacy Switches
-        self.dnssec_row = Adw.SwitchRow()
-        self.dnssec_row.set_title("Require DNSSEC")
-        self.dnssec_row.set_subtitle("Reject resolvers that do not authenticate DNSSEC signatures")
-        self.dnssec_row.set_active(self.config_mgr.require_dnssec)
-        self.dnssec_row.connect("notify::active", self._on_dnssec_toggled)
-        self.stats_group.add(self.dnssec_row)
-
-        self.nolog_row = Adw.SwitchRow()
-        self.nolog_row.set_title("Require No-Log Resolvers")
-        self.nolog_row.set_subtitle("Only query resolvers that do not log DNS transactions")
-        self.nolog_row.set_active(self.config_mgr.require_nolog)
-        self.nolog_row.connect("notify::active", self._on_nolog_toggled)
-        self.stats_group.add(self.nolog_row)
-
-    def refresh_status(self):
-        status = self.service_mgr.get_status()
-        if not status.installed:
-            self.status_row.set_title("dnscrypt-proxy is Not Installed")
-            self.status_row.set_subtitle("Install package via: sudo dnf install dnscrypt-proxy")
+    def update_status(self):
+        st = self.win.service_status
+        if not st.installed:
+            self.status_row.set_title("dnscrypt-proxy is not installed")
+            self.status_row.set_subtitle("Install it with: sudo dnf install dnscrypt-proxy")
             self.status_icon.set_from_icon_name("dialog-warning-symbolic")
-            self.btn_start.set_sensitive(False)
-            self.btn_stop.set_sensitive(False)
-            self.btn_restart.set_sensitive(False)
-        elif status.active:
-            self.status_row.set_title("DNSCrypt-Proxy is Running")
-            sub = f"Active (PID: {status.pid})" if status.pid else "Active"
-            self.status_row.set_subtitle(sub)
-            self.status_icon.set_from_icon_name("emblem-ok-symbolic")
-            self.btn_start.set_sensitive(False)
-            self.btn_stop.set_sensitive(True)
-            self.btn_restart.set_sensitive(True)
+        elif st.active:
+            self.status_row.set_title("dnscrypt-proxy is running")
+            self.status_row.set_subtitle(f"PID {st.pid}" if st.pid else "Active")
+            self.status_icon.set_from_icon_name("object-select-symbolic")
+        elif st.transitioning:
+            self.status_row.set_title(f"dnscrypt-proxy is {st.status_str}")
+            self.status_row.set_subtitle(st.substate)
+            self.status_icon.set_from_icon_name("content-loading-symbolic")
         else:
-            self.status_row.set_title("DNSCrypt-Proxy is Inactive")
-            self.status_row.set_subtitle("The background service is stopped")
-            self.status_icon.set_from_icon_name("media-playback-stop-symbolic")
-            self.btn_start.set_sensitive(True)
-            self.btn_stop.set_sensitive(False)
-            self.btn_restart.set_sensitive(True)
+            self.status_row.set_title("dnscrypt-proxy is stopped" if st.status_str != "failed" else "dnscrypt-proxy failed")
+            self.status_row.set_subtitle("Use the switch in the header bar to start it")
+            self.status_icon.set_from_icon_name("dialog-error-symbolic" if st.status_str == "failed" else "media-playback-stop-symbolic")
+        self.btn_restart.set_sensitive(st.installed)
 
-        # Check port conflict
-        has_conflict, desc = self.service_mgr.check_port_53_conflict()
-        self.conflict_row.set_visible(has_conflict and not status.active)
-        if has_conflict:
-            self.conflict_row.set_subtitle(desc)
-
-        # Update stats
-        self.lbl_resolvers_count.set_text(str(len(self.config_mgr.server_names)))
-        active_rules = sum(1 for r in self.config_mgr.rules if r.enabled)
-        total_rules = len(self.config_mgr.rules)
-        self.lbl_rules_count.set_text(f"{active_rules} active ({total_rules} total)")
-
-    def _on_start_clicked(self, _):
-        self.btn_start.set_sensitive(False)
-        self.btn_restart.set_sensitive(False)
-
-        def do_start():
-            ok, err = self.service_mgr.start()
-            GLib.idle_add(self._finish_service_action, ok, err, "start")
-
-        import threading
-        threading.Thread(target=do_start, daemon=True).start()
-
-    def _on_stop_clicked(self, _):
-        self.btn_stop.set_sensitive(False)
-        self.btn_restart.set_sensitive(False)
-
-        def do_stop():
-            ok, err = self.service_mgr.stop()
-            GLib.idle_add(self._finish_service_action, ok, err, "stop")
-
-        import threading
-        threading.Thread(target=do_stop, daemon=True).start()
-
-    def _on_restart_clicked(self, _):
-        self.btn_restart.set_sensitive(False)
-
-        def do_restart():
-            ok, err = self.service_mgr.restart()
-            GLib.idle_add(self._finish_service_action, ok, err, "restart")
-
-        import threading
-        threading.Thread(target=do_restart, daemon=True).start()
-
-    def _finish_service_action(self, ok: bool, err: str, action: str):
-        self.refresh_status()
-        if not ok and err:
-            self._show_error_toast(f"Failed to {action} service", err)
-
-    def _on_test_clicked(self, _):
-        self.btn_test.set_sensitive(False)
-        self.test_row.set_subtitle("Querying 127.0.0.1:53...")
-
-        def run_test():
-            ok, latency, res = self.service_mgr.test_dns_latency(server="127.0.0.1", port=53)
-            GLib.idle_add(self._update_test_result, ok, latency, res)
-
-        import threading
-        threading.Thread(target=run_test, daemon=True).start()
-
-    def _update_test_result(self, ok: bool, latency: float, res: str):
-        self.btn_test.set_sensitive(True)
-        if ok:
-            self.test_row.set_title("Resolution Succeeded")
-            self.test_row.set_subtitle(f"Resolved to {res} in {latency:.1f} ms")
+        routing = self.win.routing
+        for row in self._problem_rows:
+            self.routing_row.remove(row)
+        self._problem_rows = []
+        if not routing.checked:
+            return
+        if routing.protected and st.active:
+            self.routing_row.set_title("Protected")
+            self.routing_row.set_subtitle("All DNS queries go through dnscrypt-proxy")
+            self.routing_icon.set_from_icon_name("security-high-symbolic")
+            self.routing_row.set_enable_expansion(False)
+        elif routing.protected:
+            self.routing_row.set_title("Not resolving")
+            self.routing_row.set_subtitle("System DNS points at dnscrypt-proxy, but the service is not running")
+            self.routing_icon.set_from_icon_name("dialog-warning-symbolic")
+            self.routing_row.set_enable_expansion(False)
         else:
-            self.test_row.set_title("Resolution Failed")
-            self.test_row.set_subtitle(f"Error: {res}")
+            self.routing_row.set_title("Not protected: DNS leaks")
+            self.routing_row.set_subtitle(f"{len(routing.problems)} problem(s) found. Expand for details")
+            self.routing_icon.set_from_icon_name("security-low-symbolic")
+            self.routing_row.set_enable_expansion(True)
+            for problem in routing.problems:
+                row = Adw.ActionRow(title=problem, title_lines=3)
+                row.set_title_selectable(True)
+                self.routing_row.add_row(row)
+                self._problem_rows.append(row)
+        self.btn_fix.set_visible(not routing.protected)
 
-    def _on_dnssec_toggled(self, row, _):
-        self.config_mgr.require_dnssec = row.get_active()
-        self.config_mgr.set_dirty(True)
-        self.on_change_cb()
+        self.undo_row.set_visible(os.path.exists(RESOLVED_DROPIN))
 
-    def _on_nolog_toggled(self, row, _):
-        self.config_mgr.require_nolog = row.get_active()
-        self.config_mgr.set_dirty(True)
-        self.on_change_cb()
+    def update_summary(self):
+        selected = self.cfg.server_names
+        effective = resolver_db.effective_servers(self.win.catalog, self.cfg)
+        self.resolvers_row.remove_css_class("warning")
+        if not selected:
+            self.lbl_resolvers.set_text("Automatic")
+            self.resolvers_row.set_subtitle("None selected: dnscrypt-proxy picks any server that meets the requirements")
+        elif effective is None:
+            self.lbl_resolvers.set_text(f"{len(selected)} selected")
+            self.resolvers_row.set_subtitle("Resolver list is loading…")
+        else:
+            self.lbl_resolvers.set_text(f"{len(effective)} of {len(selected)} usable")
+            if len(effective) < len(selected):
+                skipped = [n for n in selected if n not in effective]
+                self.resolvers_row.set_subtitle("Skipped: " + ", ".join(skipped) + ". See the Resolvers page")
+                self.resolvers_row.add_css_class("warning")
+            else:
+                self.resolvers_row.set_subtitle(", ".join(selected))
 
-    def _show_conflict_dialog(self, _):
-        dialog = Adw.MessageDialog(
-            transient_for=self.get_root(),
-            heading="Fix Port 53 Conflict on Fedora",
+        active = sum(1 for r in self.cfg.rules if r.enabled)
+        self.lbl_rules.set_text(f"{active} active")
+        self.rules_row.set_subtitle(f"{len(self.cfg.rules)} total. Queries they match are sent as plain DNS")
+
+    # Actions
+
+    def _on_requirement_toggled(self, row, _pspec, attr):
+        if self._loading:
+            return
+        setattr(self.cfg, attr, row.get_active())
+        self.win.config_changed()
+
+    def _on_restart_clicked(self, btn):
+        btn.set_sensitive(False)
+
+        def done(result):
+            ok, err = result
+            btn.set_sensitive(True)
+            self.win.show_toast("dnscrypt-proxy restarted" if ok else err)
+            self.win.refresh_status()
+
+        run_in_thread(self.win.service_mgr.restart, done)
+
+    def _on_test_clicked(self, btn):
+        btn.set_sensitive(False)
+        self.test_row.set_subtitle("Querying…")
+        self.upstream_row.set_subtitle("Querying…")
+
+        def done(result):
+            lookup, upstream = result
+            btn.set_sensitive(True)
+            host, port = probe_target(self.cfg.listen_addresses)
+            if lookup.ok and lookup.rcode == 0 and lookup.addresses:
+                self.test_row.set_subtitle(f"cloudflare.com → {lookup.addresses[0]} in {lookup.latency_ms:.1f} ms via {host}:{port}")
+            elif lookup.ok:
+                self.test_row.set_subtitle(f"Answered with error code {lookup.rcode} in {lookup.latency_ms:.1f} ms")
+            else:
+                self.test_row.set_subtitle(f"Failed: {lookup.error}")
+            if upstream.ok and upstream.rcode in (0, 3):
+                self.upstream_row.set_subtitle(f"{upstream.latency_ms:.1f} ms")
+            elif upstream.ok:
+                self.upstream_row.set_subtitle(f"Upstream answered with error code {upstream.rcode}")
+            else:
+                self.upstream_row.set_subtitle(f"Failed: {upstream.error}")
+
+        run_in_thread(lambda: self.win.service_mgr.test_resolution(self.cfg.listen_addresses), done)
+
+    def _on_fix_clicked(self, _):
+        host, port = probe_target(self.cfg.listen_addresses)
+        dialog = Adw.AlertDialog(
+            heading="Route all DNS through dnscrypt-proxy?",
             body=(
-                "Fedora runs systemd-resolved on port 53 by default, preventing dnscrypt-proxy from binding to 127.0.0.1:53.\n\n"
-                "To resolve this, disable the systemd-resolved stub listener:\n\n"
-                "1. Create drop-in configuration:\n"
-                "   sudo mkdir -p /etc/systemd/resolved.conf.d\n"
-                "   sudo tee /etc/systemd/resolved.conf.d/dnscrypt.conf << 'EOF'\n"
-                "   [Resolve]\n"
-                "   DNS=127.0.0.1\n"
-                "   DNSStubListener=no\n"
-                "   EOF\n\n"
-                "2. Restart systemd-resolved:\n"
-                "   sudo systemctl restart systemd-resolved\n"
+                f"This will:\n"
+                f"• point systemd-resolved at dnscrypt-proxy ({host}:{port}) for every domain and turn off its fallback servers\n"
+                f"• stop NetworkManager from handing DHCP/VPN DNS servers to systemd-resolved\n"
+                f"• make /etc/resolv.conf use the systemd-resolved stub (127.0.0.53)\n\n"
+                f"VPN-provided DNS servers will no longer be used; add Domain Rules for internal VPN domains instead. "
+                f"If dnscrypt-proxy stops, name resolution stops too. Use Undo on this page to revert."
             ),
         )
-        dialog.add_response("ok", "Got It")
-        dialog.present()
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("fix", "Route DNS")
+        dialog.set_response_appearance("fix", Adw.ResponseAppearance.SUGGESTED)
 
-    def _show_error_toast(self, title: str, message: str):
-        dialog = Adw.MessageDialog(
-            transient_for=self.get_root(),
-            heading=title,
-            body=message[:300],
-        )
-        dialog.add_response("ok", "Dismiss")
-        dialog.present()
+        def on_response(_d, response):
+            if response != "fix":
+                return
+            self.btn_fix.set_sensitive(False)
+            addr = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+            def done(result):
+                self.btn_fix.set_sensitive(True)
+                if result.get("ok"):
+                    self.win.show_toast(result.get("message", "Done"))
+                else:
+                    self.win.show_message("Could not change system DNS", result.get("message", "Unknown error"))
+                self.win.refresh_status()
+
+                run_in_thread(lambda: self.win.service_mgr.setup_system_dns(addr), done)
+
+        dialog.connect("response", on_response)
+        dialog.present(self.win)
+
+    def _on_undo_clicked(self, btn):
+        btn.set_sensitive(False)
+
+        def done(result):
+            btn.set_sensitive(True)
+            if result.get("ok"):
+                self.win.show_toast(result.get("message", "Done"))
+            else:
+                self.win.show_message("Could not undo DNS routing", result.get("message", "Unknown error"))
+            self.win.refresh_status()
+
+        run_in_thread(self.win.service_mgr.undo_system_dns, done)

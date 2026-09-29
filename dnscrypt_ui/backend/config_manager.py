@@ -1,18 +1,44 @@
 """
 Configuration Manager for dnscrypt-proxy and forwarding-rules.
-Parses, edits, and writes dnscrypt-proxy.toml and forwarding-rules.txt.
-Supports surgical updates to preserve existing comments and custom settings.
+Parses, edits, and writes dnscrypt-proxy.toml and forwarding-rules.txt,
+preserving comments and every setting the UI does not manage.
 """
 
-import os
+import copy
 import re
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import Dict, List, Optional, Union
+
+from . import tomledit
+from .tomledit import toml_bool, toml_str, toml_str_list
+
+CONFIG_DIR = Path("/etc/dnscrypt-proxy")
+DEFAULT_QUERY_LOG = "/var/log/dnscrypt-proxy/query.log"
+DEFAULT_BOOTSTRAP = ["9.9.9.11:53", "8.8.8.8:53"]
+
+# Disabled rules are written with this marker so they can be told apart
+# from ordinary comments and the examples shipped in the stock file.
+DISABLED_PREFIX = "# [disabled] "
+
+# TOML key -> ConfigManager attribute, for root settings the UI manages
+ROOT_KEYS = {
+    "listen_addresses": "listen_addresses",
+    "server_names": "server_names",
+    "bootstrap_resolvers": "bootstrap_resolvers",
+    "doh_servers": "doh_servers",
+    "dnscrypt_servers": "dnscrypt_servers",
+    "require_dnssec": "require_dnssec",
+    "require_nolog": "require_nolog",
+    "require_nofilter": "require_nofilter",
+    "forwarding_rules": "forwarding_rules_file",
+}
+
+_RULE_RE = re.compile(r"^(\S+)\s+([^\s#]+)\s*(?:#\s*(.*))?$")
 
 
-@dataclass
+@dataclass(eq=False)
 class ForwardingRule:
     domain: str
     servers: List[str]
@@ -23,319 +49,233 @@ class ForwardingRule:
     def servers_str(self) -> str:
         return ", ".join(self.servers)
 
+    def to_line(self) -> str:
+        line = f"{self.domain} {','.join(self.servers)}"
+        if self.comment:
+            line += f"  # {self.comment}"
+        return line if self.enabled else DISABLED_PREFIX + line
 
-DEFAULT_SYSTEM_DIR = Path("/etc/dnscrypt-proxy")
-DEFAULT_USER_DIR = Path.home() / ".config" / "dnscrypt-proxy"
+
+def parse_rules(text: str) -> List[Union[str, ForwardingRule]]:
+    """Returns the file as a list of raw lines and ForwardingRule objects."""
+    items: List[Union[str, ForwardingRule]] = []
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        enabled = True
+        body = stripped
+        if stripped.startswith(DISABLED_PREFIX.strip()):
+            enabled = False
+            body = stripped[len(DISABLED_PREFIX.strip()):].strip()
+        elif not stripped or stripped.startswith("#"):
+            items.append(raw)
+            continue
+
+        m = _RULE_RE.match(body)
+        if not m:
+            items.append(raw)
+            continue
+        servers = [s.strip() for s in m.group(2).split(",") if s.strip()]
+        items.append(ForwardingRule(m.group(1), servers, (m.group(3) or "").strip(), enabled))
+    return items
 
 
-DEFAULT_TOML_TEMPLATE = """# Configuration for dnscrypt-proxy managed by DNSCrypt UI
-listen_addresses = ['127.0.0.1:53']
-max_clients = 250
-
-# Active upstream resolvers (DoH, DNSCrypt)
-server_names = ['quad9-doh-ip4-filter-pri', 'cloudflare']
-
-# Fallback resolvers when no upstream servers can be reached
-fallback_resolvers = ['9.9.9.9:53', '1.1.1.1:53']
-
-# Protocol filters
-doh_servers = true
-dnscrypt_servers = true
-
-# Security and privacy requirements
-require_dnssec = false
-require_nolog = false
-require_nofilter = false
-
-# Split-DNS / YogaDNS style domain-based forwarding rules
-forwarding_rules = 'forwarding-rules.txt'
-
-# Live DNS query logging
-[query_log]
-file = '/var/log/dnscrypt-proxy/query.log'
-format = 'tsv'
-ignored = []
-"""
-
-DEFAULT_RULES_TEMPLATE = """# Forwarding rules for dnscrypt-proxy (Split-DNS / YogaDNS style)
-# Syntax: <domain_pattern> <resolver_ip_1>[,<resolver_ip_2>]
-#
-# Examples:
-# Route local home/LAN devices to local router
-*.lan 192.168.1.1:53
-*.local 192.168.1.1:53
-
-# Route corporate / work intranet domains to internal company DNS
-# *.internal 10.0.0.53
+RULES_HEADER = """# Forwarding rules for dnscrypt-proxy, managed by DNSCrypt UI.
+# Syntax: <domain> <server>[,<server>...]  [# note]
+# A rule for example.com also matches all of its subdomains.
+# Queries forwarded here are sent as plain, unencrypted DNS.
 """
 
 
 class ConfigManager:
     def __init__(self, config_dir: Optional[Path] = None):
-        if config_dir:
-            self.config_dir = Path(config_dir)
-        elif DEFAULT_SYSTEM_DIR.exists():
-            self.config_dir = DEFAULT_SYSTEM_DIR
-        else:
-            self.config_dir = DEFAULT_USER_DIR
-
+        self.config_dir = Path(config_dir) if config_dir else CONFIG_DIR
         self.toml_path = self.config_dir / "dnscrypt-proxy.toml"
-        self.rules_path = self.config_dir / "forwarding-rules.txt"
 
-        # Parsed state
         self.raw_toml: str = ""
+        self.raw_rules: str = ""
         self.parsed_toml: dict = {}
+        self.load_error: str = ""
+
         self.listen_addresses: List[str] = ["127.0.0.1:53"]
-        self.server_names: List[str] = ["quad9-doh-ip4-filter-pri", "cloudflare"]
-        self.fallback_resolvers: List[str] = ["9.9.9.9:53", "1.1.1.1:53"]
-        self.doh_servers: bool = True
-        self.dnscrypt_servers: bool = True
-        self.require_dnssec: bool = False
-        self.require_nolog: bool = False
-        self.require_nofilter: bool = False
-        self.forwarding_rules_file: str = "forwarding-rules.txt"
-        self.query_log_enabled: bool = True
-        self.query_log_file: str = "/var/log/dnscrypt-proxy/query.log"
+        self.server_names: List[str] = []
+        self.bootstrap_resolvers: List[str] = list(DEFAULT_BOOTSTRAP)
+        self.ipv4_servers = True
+        self.ipv6_servers = False
+        self.doh_servers = True
+        self.dnscrypt_servers = True
+        self.odoh_servers = False
+        self.require_dnssec = False
+        self.require_nolog = True
+        self.require_nofilter = True
+        self.forwarding_rules_file = "forwarding-rules.txt"
+        self.query_log_enabled = False
+        self.query_log_file = DEFAULT_QUERY_LOG
+        self.static_stamps: Dict[str, str] = {}
 
         self.rules: List[ForwardingRule] = []
-        self._dirty: bool = False
+        self._rule_items: List[Union[str, ForwardingRule]] = []
 
         self.load()
 
     @property
-    def is_dirty(self) -> bool:
-        return self._dirty
+    def available(self) -> bool:
+        return self.toml_path.exists() and not self.load_error
 
-    def set_dirty(self, dirty: bool = True):
-        self._dirty = dirty
+    @property
+    def rules_path(self) -> Path:
+        p = Path(self.forwarding_rules_file)
+        return p if p.is_absolute() else self.config_dir / p
+
+    # Loading
 
     def load(self):
-        """Loads configuration from files or initializes with defaults."""
-        self._load_toml()
-        self._load_rules()
-        self._dirty = False
-
-    def _load_toml(self):
-        if self.toml_path.exists():
-            try:
-                with open(self.toml_path, "r", encoding="utf-8") as f:
-                    self.raw_toml = f.read()
-                self.parsed_toml = tomllib.loads(self.raw_toml)
-            except Exception as e:
-                print(f"[ConfigManager] Error reading {self.toml_path}: {e}")
-                self.raw_toml = DEFAULT_TOML_TEMPLATE
-                self.parsed_toml = tomllib.loads(self.raw_toml)
-        else:
-            self.raw_toml = DEFAULT_TOML_TEMPLATE
+        self.load_error = ""
+        try:
+            self.raw_toml = self.toml_path.read_text(encoding="utf-8")
             self.parsed_toml = tomllib.loads(self.raw_toml)
+        except FileNotFoundError:
+            self.raw_toml = ""
+            self.parsed_toml = {}
+            self.load_error = f"{self.toml_path} does not exist. Is dnscrypt-proxy installed?"
+        except (OSError, tomllib.TOMLDecodeError) as e:
+            self.parsed_toml = {}
+            self.load_error = f"Cannot read {self.toml_path}: {e}"
 
-        # Extract values
-        self.listen_addresses = list(self.parsed_toml.get("listen_addresses", ["127.0.0.1:53"]))
-        self.server_names = list(self.parsed_toml.get("server_names", ["quad9-doh-ip4-filter-pri", "cloudflare"]))
-        self.fallback_resolvers = list(self.parsed_toml.get("fallback_resolvers", ["9.9.9.9:53", "1.1.1.1:53"]))
-        self.doh_servers = bool(self.parsed_toml.get("doh_servers", True))
-        self.dnscrypt_servers = bool(self.parsed_toml.get("dnscrypt_servers", True))
-        self.require_dnssec = bool(self.parsed_toml.get("require_dnssec", False))
-        self.require_nolog = bool(self.parsed_toml.get("require_nolog", False))
-        self.require_nofilter = bool(self.parsed_toml.get("require_nofilter", False))
-        self.forwarding_rules_file = str(self.parsed_toml.get("forwarding_rules", "forwarding-rules.txt"))
+        t = self.parsed_toml
+        self.listen_addresses = list(t.get("listen_addresses", ["127.0.0.1:53"]))
+        self.server_names = list(t.get("server_names", []))
+        self.bootstrap_resolvers = list(
+            t.get("bootstrap_resolvers") or t.get("fallback_resolvers") or DEFAULT_BOOTSTRAP
+        )
+        self.ipv4_servers = bool(t.get("ipv4_servers", True))
+        self.ipv6_servers = bool(t.get("ipv6_servers", False))
+        self.doh_servers = bool(t.get("doh_servers", True))
+        self.dnscrypt_servers = bool(t.get("dnscrypt_servers", True))
+        self.odoh_servers = bool(t.get("odoh_servers", False))
+        self.require_dnssec = bool(t.get("require_dnssec", False))
+        self.require_nolog = bool(t.get("require_nolog", True))
+        self.require_nofilter = bool(t.get("require_nofilter", True))
+        self.forwarding_rules_file = str(t.get("forwarding_rules", "forwarding-rules.txt"))
 
-        qlog = self.parsed_toml.get("query_log", {})
-        if isinstance(qlog, dict):
-            self.query_log_file = qlog.get("file", "/var/log/dnscrypt-proxy/query.log")
-            self.query_log_enabled = bool(self.query_log_file and not self.query_log_file.startswith("#"))
-        else:
-            self.query_log_enabled = False
+        qlog = t.get("query_log", {})
+        qfile = qlog.get("file", "") if isinstance(qlog, dict) else ""
+        self.query_log_enabled = bool(qfile)
+        self.query_log_file = qfile or DEFAULT_QUERY_LOG
+
+        static = t.get("static", {})
+        self.static_stamps = {
+            name: entry["stamp"]
+            for name, entry in (static.items() if isinstance(static, dict) else [])
+            if isinstance(entry, dict) and "stamp" in entry
+        }
+
+        self._loaded = {key: copy.deepcopy(getattr(self, attr)) for key, attr in ROOT_KEYS.items()}
+        self._load_rules()
+        self._baseline = self.get_staged_files() if self.available else {}
 
     def _load_rules(self):
-        self.rules = []
-        rules_path = self.rules_path
-        if not rules_path.is_absolute():
-            rules_path = self.config_dir / self.forwarding_rules_file
+        try:
+            self.raw_rules = self.rules_path.read_text(encoding="utf-8")
+        except OSError:
+            self.raw_rules = ""
+        text = self.raw_rules if self.raw_rules.strip() else RULES_HEADER
+        self._rule_items = parse_rules(text)
+        self.rules = [i for i in self._rule_items if isinstance(i, ForwardingRule)]
 
-        if not rules_path.exists():
-            # Check default template
-            lines = DEFAULT_RULES_TEMPLATE.splitlines()
-        else:
-            try:
-                with open(rules_path, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
-            except Exception as e:
-                print(f"[ConfigManager] Error reading rules from {rules_path}: {e}")
-                lines = []
+    @property
+    def query_log_path(self) -> Path:
+        p = Path(self.query_log_file)
+        return p if p.is_absolute() else self.config_dir / p
 
-        last_comment = ""
-        for line in lines:
-            line_str = line.strip()
-            if not line_str:
-                last_comment = ""
-                continue
-            if line_str.startswith("#"):
-                # Check if it's a disabled rule: e.g. '# *.corp 10.0.0.1'
-                content = line_str.lstrip("#").strip()
-                tokens = content.split()
-                if len(tokens) >= 2 and ("." in tokens[0] or ":" in tokens[1] or re.match(r"^\d+\.\d+\.\d+\.\d+", tokens[1])):
-                    domain = tokens[0]
-                    servers = [s.strip() for s in tokens[1].split(",") if s.strip()]
-                    self.rules.append(ForwardingRule(domain=domain, servers=servers, comment=last_comment, enabled=False))
-                    last_comment = ""
-                else:
-                    last_comment = content
-                continue
+    @property
+    def is_dirty(self) -> bool:
+        if not self.available:
+            return False
+        return self.get_staged_files() != self._baseline
 
-            # Active rule
-            tokens = line_str.split(None, 1)
-            if len(tokens) >= 2:
-                domain = tokens[0]
-                rest = tokens[1].split("#", 1)
-                servers_part = rest[0].strip()
-                inline_comment = rest[1].strip() if len(rest) > 1 else ""
-                comment = inline_comment or last_comment
-                servers = [s.strip() for s in servers_part.split(",") if s.strip()]
-                self.rules.append(ForwardingRule(domain=domain, servers=servers, comment=comment, enabled=True))
-                last_comment = ""
+    # Rule management
 
-    # Rule Management Methods
     def add_rule(self, domain: str, servers: List[str], comment: str = "", enabled: bool = True):
-        rule = ForwardingRule(domain=domain.strip(), servers=servers, comment=comment.strip(), enabled=enabled)
+        rule = ForwardingRule(domain, list(servers), comment, enabled)
         self.rules.append(rule)
-        self.set_dirty()
+        self._rule_items.append(rule)
 
-    def update_rule(self, index: int, domain: str, servers: List[str], comment: str = "", enabled: bool = True):
-        if 0 <= index < len(self.rules):
-            self.rules[index] = ForwardingRule(domain=domain.strip(), servers=servers, comment=comment.strip(), enabled=enabled)
-            self.set_dirty()
+    def update_rule(self, rule: ForwardingRule, domain: str, servers: List[str], comment: str):
+        rule.domain = domain
+        rule.servers = list(servers)
+        rule.comment = comment
 
-    def remove_rule(self, index: int):
-        if 0 <= index < len(self.rules):
-            self.rules.pop(index)
-            self.set_dirty()
+    def remove_rule(self, rule: ForwardingRule):
+        self.rules = [r for r in self.rules if r is not rule]
+        self._rule_items = [i for i in self._rule_items if i is not rule]
 
-    def toggle_rule(self, index: int):
-        if 0 <= index < len(self.rules):
-            self.rules[index].enabled = not self.rules[index].enabled
-            self.set_dirty()
+    # Upstream resolvers
 
-    # Upstream Resolver Management
     def toggle_resolver(self, name: str, active: bool):
         if active and name not in self.server_names:
             self.server_names.append(name)
-            self.set_dirty()
         elif not active and name in self.server_names:
             self.server_names.remove(name)
-            self.set_dirty()
 
-    def set_resolvers(self, names: List[str]):
-        if self.server_names != names:
-            self.server_names = list(names)
-            self.set_dirty()
+    def add_static_resolver(self, name: str, stamp: str):
+        self.static_stamps[name] = stamp
+        self.toggle_resolver(name, True)
 
     # Serialization
+
     def generate_rules_content(self) -> str:
-        lines = [
-            "# Forwarding rules generated by DNSCrypt UI",
-            "# YogaDNS-style Split DNS (domain pattern -> target resolver)",
-            "",
-        ]
-        for r in self.rules:
-            if r.comment:
-                lines.append(f"# {r.comment}")
-            servers_part = ",".join(r.servers)
-            if r.enabled:
-                lines.append(f"{r.domain} {servers_part}")
-            else:
-                lines.append(f"# {r.domain} {servers_part}")
-            lines.append("")
-        return "\n".join(lines)
+        lines = [i.to_line() if isinstance(i, ForwardingRule) else i for i in self._rule_items]
+        return "\n".join(lines).rstrip("\n") + "\n"
 
     def generate_toml_content(self) -> str:
-        """
-        Surgically updates the existing TOML or creates a clean new one.
-        Ensures all root-level keys remain in the root section before any [section] header.
-        """
-        base = self.raw_toml if self.raw_toml.strip() else DEFAULT_TOML_TEMPLATE
-        raw_lines = base.splitlines()
-
-        # 1. Clean up any broken appended settings at the end of the file
-        cleaned_lines = []
-        skip_appended = False
-        for l in raw_lines:
-            if "# Settings added by DNSCrypt UI" in l or "# Root settings managed by DNSCrypt UI" in l:
-                skip_appended = True
-            if not skip_appended:
-                cleaned_lines.append(l)
-
-        def format_str_list(lst: List[str]) -> str:
-            items = ", ".join(f"'{x}'" for x in lst)
-            return f"[{items}]"
-
-        keys_to_update = {
-            "listen_addresses": format_str_list(self.listen_addresses),
-            "server_names": format_str_list(self.server_names),
-            "fallback_resolvers": format_str_list(self.fallback_resolvers),
-            "doh_servers": "true" if self.doh_servers else "false",
-            "dnscrypt_servers": "true" if self.dnscrypt_servers else "false",
-            "require_dnssec": "true" if self.require_dnssec else "false",
-            "require_nolog": "true" if self.require_nolog else "false",
-            "require_nofilter": "true" if self.require_nofilter else "false",
-            "forwarding_rules": f"'{self.forwarding_rules_file}'",
+        text = self.raw_toml
+        root = {
+            "listen_addresses": toml_str_list(self.listen_addresses),
+            "server_names": toml_str_list(self.server_names),
+            "bootstrap_resolvers": toml_str_list(self.bootstrap_resolvers),
+            "doh_servers": toml_bool(self.doh_servers),
+            "dnscrypt_servers": toml_bool(self.dnscrypt_servers),
+            "require_dnssec": toml_bool(self.require_dnssec),
+            "require_nolog": toml_bool(self.require_nolog),
+            "require_nofilter": toml_bool(self.require_nofilter),
+            "forwarding_rules": toml_str(self.forwarding_rules_file),
         }
+        t = self.parsed_toml
+        for key, value in root.items():
+            # Only write what the user changed, so untouched settings keep
+            # their original formatting and missing keys stay at defaults.
+            if getattr(self, ROOT_KEYS[key]) == self._loaded.get(key):
+                continue
+            text = tomledit.set_key(text, None, key, value)
 
-        updated_keys = set()
-        new_lines = []
-        in_root_section = True
+        # fallback_resolvers was renamed and is ignored once bootstrap_resolvers exists
+        if "fallback_resolvers" in t:
+            if "bootstrap_resolvers" not in t:
+                text = tomledit.set_key(text, None, "bootstrap_resolvers", root["bootstrap_resolvers"])
+            text = tomledit.remove_key(text, None, "fallback_resolvers")
 
-        for line in cleaned_lines:
-            stripped = line.strip()
+        qlog = t.get("query_log", {}) if isinstance(t.get("query_log"), dict) else {}
+        if self.query_log_enabled:
+            if qlog.get("file") != self.query_log_file:
+                text = tomledit.set_key(text, "query_log", "file", toml_str(self.query_log_file))
+            if qlog.get("format") != "tsv":
+                text = tomledit.set_key(text, "query_log", "format", toml_str("tsv"))
+        elif "file" in qlog:
+            text = tomledit.remove_key(text, "query_log", "file")
 
-            # When we encounter the first section header (e.g. [query_log], [static], etc.)
-            if in_root_section and stripped.startswith("[") and not stripped.startswith("['"):
-                in_root_section = False
-                # Insert any root keys that haven't been matched yet BEFORE this section!
-                missing = [k for k in keys_to_update if k not in updated_keys]
-                if missing:
-                    new_lines.append("\n# Root settings managed by DNSCrypt UI")
-                    for k in missing:
-                        new_lines.append(f"{k} = {keys_to_update[k]}")
-                        updated_keys.add(k)
-                    new_lines.append("")
+        existing_static = t.get("static", {}) if isinstance(t.get("static"), dict) else {}
+        for name, stamp in self.static_stamps.items():
+            if name in existing_static:
+                if existing_static[name].get("stamp") != stamp:
+                    text = tomledit.set_key(text, f"static.{name}", "stamp", toml_str(stamp))
+                continue
+            suffix = "" if text.endswith("\n") else "\n"
+            text += f"{suffix}\n[static.{toml_str(name)}]\nstamp = {toml_str(stamp)}\n"
 
-            if in_root_section:
-                matched = False
-                for k, val in keys_to_update.items():
-                    # Match both 'key =' and '# key =' in root section!
-                    pattern = rf"^\s*#?\s*{re.escape(k)}\s*="
-                    if re.match(pattern, stripped):
-                        new_lines.append(f"{k} = {val}")
-                        updated_keys.add(k)
-                        matched = True
-                        break
-                if not matched:
-                    new_lines.append(line)
-            else:
-                new_lines.append(line)
+        return text
 
-        # If there were no section headers, insert any remaining missing keys
-        missing = [k for k in keys_to_update if k not in updated_keys]
-        if missing:
-            new_lines.append("\n# Root settings managed by DNSCrypt UI")
-            for k in missing:
-                new_lines.append(f"{k} = {keys_to_update[k]}")
-
-        # Ensure [query_log] is properly configured
-        content = "\n".join(new_lines)
-        if "[query_log]" not in content:
-            content += f"\n\n[query_log]\nfile = '{self.query_log_file}'\nformat = 'tsv'\n"
-
-        return content
-
-    def get_staged_files(self) -> Dict[Path, str]:
-        """Returns dict of destination Path -> file content to write."""
-        rules_path = self.rules_path
-        if not rules_path.is_absolute():
-            rules_path = self.config_dir / self.forwarding_rules_file
-
+    def get_staged_files(self) -> Dict[str, str]:
         return {
-            self.toml_path: self.generate_toml_content(),
-            rules_path: self.generate_rules_content(),
+            "toml": self.generate_toml_content(),
+            "rules": self.generate_rules_content(),
         }

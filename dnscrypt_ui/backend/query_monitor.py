@@ -1,15 +1,18 @@
 """
 DNS Query Log Monitor.
-Reads and watches dnscrypt-proxy query.log in real time,
-providing structured query logs for the live inspector view.
+Tails dnscrypt-proxy's TSV query log in a worker thread and hands parsed
+entries to registered callbacks.
 """
 
-import os
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional
+
+# Return codes dnscrypt-proxy writes when a plugin stopped the query
+BLOCKED_CODES = {"REJECT", "DROP", "CLOAK", "SYNTH"}
+ERROR_CODES = {"SERVFAIL", "NETWORK_ERROR", "RESPONSE_ERROR", "PARSE_ERROR", "NOT_READY"}
 
 
 @dataclass
@@ -18,31 +21,65 @@ class QueryEntry:
     client: str
     domain: str
     qtype: str
-    status: str  # "PASS", "BLOCKED", "SYNTH", "FORWARD"
+    status: str  # PASS, FORWARD, CACHE, REJECT, ...
+    duration: str
     server: str
 
     @property
     def is_blocked(self) -> bool:
-        return "BLOCK" in self.status.upper()
+        return self.status.upper() in BLOCKED_CODES
+
+    @property
+    def is_error(self) -> bool:
+        return self.status.upper() in ERROR_CODES
+
+
+def parse_line(line: str) -> Optional[QueryEntry]:
+    """
+    Parses one TSV line:
+    [2026-09-29 20:49:12]<TAB>127.0.0.1<TAB>example.com<TAB>A<TAB>PASS<TAB>4ms<TAB>cloudflare
+    """
+    line = line.rstrip("\n")
+    if not line.strip() or line.startswith("#"):
+        return None
+    parts = line.split("\t")
+    if len(parts) < 5:
+        return None
+
+    time_str = parts[0].strip().strip("[]")
+    if " " in time_str:
+        time_str = time_str.split(" ")[-1]
+
+    return QueryEntry(
+        time_str=time_str,
+        client=parts[1],
+        domain=parts[2],
+        qtype=parts[3],
+        status=parts[4],
+        duration=parts[5] if len(parts) > 5 else "",
+        server=parts[6] if len(parts) > 6 and parts[6] != "-" else "",
+    )
 
 
 class QueryMonitor:
-    def __init__(self, log_path: str = "/var/log/dnscrypt-proxy/query.log", max_entries: int = 500):
+    def __init__(self, log_path: str, max_entries: int = 500):
         self.log_path = Path(log_path)
         self.max_entries = max_entries
         self.entries: List[QueryEntry] = []
+        self.last_error: str = ""
         self._running = False
-        self._paused = False
         self._thread: Optional[threading.Thread] = None
-        self._file_obj = None
         self._callbacks: List[Callable[[List[QueryEntry]], None]] = []
         self._lock = threading.Lock()
+        self._path_changed = threading.Event()
 
     def add_callback(self, cb: Callable[[List[QueryEntry]], None]):
         self._callbacks.append(cb)
 
-    def set_paused(self, paused: bool):
-        self._paused = paused
+    def set_log_path(self, path: str):
+        if Path(path) != self.log_path:
+            self.log_path = Path(path)
+            self._path_changed.set()
 
     def clear(self):
         with self._lock:
@@ -57,102 +94,75 @@ class QueryMonitor:
 
     def stop(self):
         self._running = False
+        self._path_changed.set()
         if self._thread:
-            self._thread.join(timeout=1.0)
+            self._thread.join(timeout=2.0)
             self._thread = None
-        if self._file_obj:
+
+    def _emit(self, new_entries: List[QueryEntry]):
+        with self._lock:
+            self.entries.extend(new_entries)
+            del self.entries[:-self.max_entries]
+        for cb in self._callbacks:
             try:
-                self._file_obj.close()
-            except Exception:
-                pass
-            self._file_obj = None
-
-    def _parse_line(self, line: str) -> Optional[QueryEntry]:
-        line = line.strip()
-        if not line or line.startswith("#"):
-            return None
-
-        # Tab or multi-space separated
-        parts = line.split("\t")
-        if len(parts) < 3:
-            parts = line.split()
-
-        if len(parts) < 4:
-            return None
-
-        # Common TSV: [Time, Client, Domain, Type, Return/Status, Cache, Server]
-        time_str = parts[0]
-        client = parts[1]
-        domain = parts[2]
-        qtype = parts[3] if len(parts) > 3 else "A"
-        status = parts[4] if len(parts) > 4 else "PASS"
-        server = parts[6] if len(parts) > 6 else (parts[5] if len(parts) > 5 else "local")
-
-        # Normalize timestamp if unix epoch
-        if time_str.isdigit():
-            try:
-                epoch = int(time_str)
-                time_str = time.strftime("%H:%M:%S", time.localtime(epoch))
-            except Exception:
-                pass
-        elif " " in time_str:
-            # e.g. 2026-09-25 17:30:15 -> extract 17:30:15
-            time_str = time_str.split(" ")[-1]
-
-        return QueryEntry(
-            time_str=time_str,
-            client=client,
-            domain=domain,
-            qtype=qtype,
-            status=status,
-            server=server,
-        )
+                cb(new_entries)
+            except Exception as e:
+                print(f"[QueryMonitor] Callback error: {e}")
 
     def _tail_worker(self):
-        last_inode = None
-
+        f = None
+        inode = None
+        position = 0
         while self._running:
             try:
-                if not self.log_path.exists():
-                    time.sleep(2.0)
+                if self._path_changed.is_set():
+                    self._path_changed.clear()
+                    if f:
+                        f.close()
+                    f, inode = None, None
+
+                try:
+                    st = self.log_path.stat()
+                except FileNotFoundError:
+                    self.last_error = f"{self.log_path} does not exist yet"
+                    if f:
+                        f.close()
+                    f, inode = None, None
+                    self._path_changed.wait(2.0)
                     continue
 
-                stat = self.log_path.stat()
-                if stat.st_ino != last_inode:
-                    if self._file_obj:
-                        self._file_obj.close()
-                    # Open and seek near end (last 50KB)
-                    self._file_obj = open(self.log_path, "r", encoding="utf-8", errors="replace")
-                    file_size = stat.st_size
-                    if file_size > 50000:
-                        self._file_obj.seek(file_size - 50000)
-                        self._file_obj.readline()  # discard partial line
-                    last_inode = stat.st_ino
+                if f is None or st.st_ino != inode or st.st_size < position:
+                    # New file, rotation, or truncation: reopen and show the tail
+                    if f:
+                        f.close()
+                    f = open(self.log_path, "rb")
+                    inode = st.st_ino
+                    if st.st_size > 50000:
+                        f.seek(st.st_size - 50000)
+                        f.readline()  # discard partial line
+                self.last_error = ""
 
-                lines = self._file_obj.readlines()
-                if lines and not self._paused:
-                    new_entries = []
-                    for l in lines:
-                        parsed = self._parse_line(l)
-                        if parsed:
-                            new_entries.append(parsed)
-
+                chunk = f.read()
+                if chunk:
+                    # Leave an incomplete trailing line for the next round
+                    cut = chunk.rfind(b"\n") + 1
+                    if cut < len(chunk):
+                        f.seek(cut - len(chunk), 1)
+                        chunk = chunk[:cut]
+                    text = chunk.decode("utf-8", errors="replace")
+                    new_entries = [e for e in map(parse_line, text.splitlines()) if e]
                     if new_entries:
-                        with self._lock:
-                            self.entries.extend(new_entries)
-                            if len(self.entries) > self.max_entries:
-                                self.entries = self.entries[-self.max_entries:]
-
-                        for cb in self._callbacks:
-                            try:
-                                cb(new_entries)
-                            except Exception as e:
-                                print(f"[QueryMonitor] Callback error: {e}")
-
-                time.sleep(1.0)
+                        self._emit(new_entries)
+                position = f.tell()
+                self._path_changed.wait(1.0)
+            except PermissionError:
+                self.last_error = f"No permission to read {self.log_path}"
+                f = None
+                self._path_changed.wait(5.0)
             except Exception as e:
-                time.sleep(2.0)
+                self.last_error = str(e)
+                f = None
+                self._path_changed.wait(2.0)
 
-        if self._file_obj:
-            self._file_obj.close()
-            self._file_obj = None
+        if f:
+            f.close()

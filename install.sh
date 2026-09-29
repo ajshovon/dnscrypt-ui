@@ -1,39 +1,46 @@
 #!/usr/bin/env bash
-set -e
+# Installs DNSCrypt UI for the current user, plus the root-owned privileged
+# helper and its polkit action (needs sudo; skip with --user-only).
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
 APP_DIR="$HOME/.local/share/applications"
 ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
+HELPER_DEST="/usr/local/libexec/dnscrypt-ui-helper"
+POLICY_DEST="/usr/share/polkit-1/actions/io.github.shovon.DNSCryptUI.policy"
 
-echo "==> Installing DNSCrypt UI for user $(whoami)..."
+USER_ONLY=0
+[[ "${1:-}" == "--user-only" ]] && USER_ONLY=1
 
-# Ensure directories exist
-mkdir -p "$BIN_DIR"
-mkdir -p "$APP_DIR"
-mkdir -p "$ICON_DIR"
+echo "==> Installing DNSCrypt UI for $(whoami)..."
+mkdir -p "$BIN_DIR" "$APP_DIR" "$ICON_DIR"
 
-# 1. Symlink binary
 chmod +x "$SCRIPT_DIR/bin/dnscrypt-ui"
 ln -sf "$SCRIPT_DIR/bin/dnscrypt-ui" "$BIN_DIR/dnscrypt-ui"
-echo "  [✓] Linked executable to $BIN_DIR/dnscrypt-ui"
+echo "  [✓] Linked $BIN_DIR/dnscrypt-ui"
 
-# 2. Install icon
-cp "$SCRIPT_DIR/data/icons/io.github.shovon.DNSCryptUI.svg" "$ICON_DIR/io.github.shovon.DNSCryptUI.svg"
-echo "  [✓] Installed icon to $ICON_DIR"
+cp "$SCRIPT_DIR/data/icons/io.github.shovon.DNSCryptUI.svg" "$ICON_DIR/"
+echo "  [✓] Installed icon"
 
-# 3. Install desktop entry with updated Exec path
-sed "s|^Exec=.*|Exec=$BIN_DIR/dnscrypt-ui|" "$SCRIPT_DIR/data/io.github.shovon.DNSCryptUI.desktop" > "$APP_DIR/io.github.shovon.DNSCryptUI.desktop"
-chmod +x "$APP_DIR/io.github.shovon.DNSCryptUI.desktop"
-echo "  [✓] Installed desktop entry to $APP_DIR"
+sed "s|^Exec=.*|Exec=$BIN_DIR/dnscrypt-ui|" \
+    "$SCRIPT_DIR/data/io.github.shovon.DNSCryptUI.desktop" > "$APP_DIR/io.github.shovon.DNSCryptUI.desktop"
+echo "  [✓] Installed desktop entry"
 
-# 4. Update desktop & icon caches
-if command -v update-desktop-database >/dev/null 2>&1; then
-    update-desktop-database "$APP_DIR" || true
-fi
-if command -v gtk4-update-icon-cache >/dev/null 2>&1; then
-    gtk4-update-icon-cache "$HOME/.local/share/icons/hicolor" -t -f || true
+command -v update-desktop-database >/dev/null && update-desktop-database "$APP_DIR" || true
+command -v gtk4-update-icon-cache >/dev/null && gtk4-update-icon-cache -q -t -f "$HOME/.local/share/icons/hicolor" || true
+
+if [[ $USER_ONLY -eq 0 ]]; then
+    echo "==> Installing the privileged helper (sudo)..."
+    # Root-owned copy outside your home, so other programs running as you
+    # cannot change what pkexec runs as root.
+    sudo install -D -o root -g root -m 0755 "$SCRIPT_DIR/helper/dnscrypt-ui-helper" "$HELPER_DEST"
+    sudo install -D -o root -g root -m 0644 "$SCRIPT_DIR/data/io.github.shovon.DNSCryptUI.policy" "$POLICY_DEST"
+    command -v restorecon >/dev/null && sudo restorecon "$HELPER_DEST" "$POLICY_DEST" || true
+    echo "  [✓] Installed $HELPER_DEST and polkit action"
+else
+    echo "  [!] Skipped the privileged helper; the app will run it from $SCRIPT_DIR/helper"
 fi
 
 echo ""
-echo "==> Installation complete! You can now launch 'DNSCrypt UI' from your GNOME app drawer or run 'dnscrypt-ui' in terminal."
+echo "==> Done. Launch 'DNSCrypt UI' from the app grid or run 'dnscrypt-ui'."

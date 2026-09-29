@@ -1,271 +1,275 @@
 """
-Resolvers View for DNSCrypt UI.
-Browse, search, and enable/disable upstream DoH and DNSCrypt resolvers.
+Resolvers page: choose which encrypted upstream servers dnscrypt-proxy uses.
+The list comes from dnscrypt-proxy's own sources, so names always exist.
 """
 
 import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Gtk, Adw, GLib
+from gi.repository import Adw, Gtk
 
-from ..backend.config_manager import ConfigManager
-from ..backend.resolver_db import get_all_resolvers, find_resolver
+from ..backend import resolver_db, validate
+
+MAX_ROWS = 80
+SCOPES = [("Selected", "selected"), ("Recommended", "recommended"), ("All", "all")]
+
+
+def _badge(text: str, kind: str) -> Gtk.Label:
+    return Gtk.Label(label=text, valign=Gtk.Align.CENTER, css_classes=["dns-badge", f"dns-badge-{kind}"])
 
 
 class ResolversView(Adw.PreferencesPage):
-    def __init__(self, config_mgr: ConfigManager, on_change_cb):
+    def __init__(self, win):
         super().__init__()
-        self.config_mgr = config_mgr
-        self.on_change_cb = on_change_cb
-
-        self.set_title("Resolvers")
-        self.set_icon_name("cloud-symbolic")
-
-        self._search_query = ""
-        self._protocol_filter = "ALL"  # ALL, DOH, DNSCRYPT, DNSSEC, NOLOG
-
+        self.win = win
+        self.cfg = win.config_mgr
+        self._query = ""
+        self._scope = "recommended"
+        self._proto = "any"
+        self._usable_only = False
+        self._switches = {}
         self._build_ui()
-        self.reload_resolvers()
+        self.reload()
 
     def _build_ui(self):
-        # Header Group
-        top_group = Adw.PreferencesGroup()
-        top_group.set_title("Upstream DNS Resolvers")
-        top_group.set_description(
-            "Select which public DoH (DNS over HTTPS) or DNSCrypt resolvers dnscrypt-proxy forwards general traffic to."
+        top = Adw.PreferencesGroup(
+            title="Upstream Resolvers",
+            description="dnscrypt-proxy sends every query that no Domain Rule matches to these servers, encrypted.",
         )
-        self.add(top_group)
+        self.add(top)
 
-        # Toolbar Container (No ActionRow squishing)
-        toolbar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        toolbar_box.set_margin_top(4)
-        toolbar_box.set_margin_bottom(12)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin_top=4)
+        row1 = Gtk.Box(spacing=10)
+        search = Gtk.SearchEntry(placeholder_text="Search by name or description…", hexpand=True)
+        search.connect("search-changed", self._on_search_changed)
+        row1.append(search)
+        btn_refresh = Gtk.Button(icon_name="view-refresh-symbolic", valign=Gtk.Align.CENTER)
+        btn_refresh.set_tooltip_text("Reload the resolver list from dnscrypt-proxy")
+        btn_refresh.connect("clicked", lambda _: self.win.refresh_catalog())
+        row1.append(btn_refresh)
+        btn_custom = Gtk.Button(label="Add Stamp", valign=Gtk.Align.CENTER)
+        btn_custom.set_tooltip_text("Add a server from an sdns:// stamp")
+        btn_custom.connect("clicked", lambda _: self._show_add_stamp_dialog())
+        row1.append(btn_custom)
+        box.append(row1)
 
-        # Row 1: Search Entry + Add Custom Button
-        search_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        row2 = Gtk.Box(spacing=12)
+        scope_box = Gtk.Box(css_classes=["linked"])
+        first = None
+        for label, code in SCOPES:
+            btn = Gtk.ToggleButton(label=label, active=code == self._scope)
+            if first:
+                btn.set_group(first)
+            first = first or btn
+            btn.connect("toggled", self._on_scope_toggled, code)
+            scope_box.append(btn)
+        row2.append(scope_box)
 
-        search_entry = Gtk.SearchEntry()
-        search_entry.set_placeholder_text("Search resolvers by name, provider, or features...")
-        search_entry.set_hexpand(True)
-        search_entry.connect("search-changed", self._on_search_changed)
-        search_row.append(search_entry)
+        proto = Gtk.DropDown.new_from_strings(["Any protocol", "DoH", "DNSCrypt"])
+        proto.connect("notify::selected", self._on_proto_changed)
+        row2.append(proto)
 
-        btn_custom = Gtk.Button(label="Add Custom")
-        btn_custom.set_icon_name("list-add-symbolic")
-        btn_custom.add_css_class("suggested-action")
-        btn_custom.set_valign(Gtk.Align.CENTER)
-        btn_custom.connect("clicked", lambda _: self._show_add_custom_dialog())
-        search_row.append(btn_custom)
+        usable = Gtk.CheckButton(label="Usable only")
+        usable.set_tooltip_text("Hide servers that the current requirements would skip")
+        usable.connect("toggled", self._on_usable_toggled)
+        row2.append(usable)
+        box.append(row2)
 
-        toolbar_box.append(search_row)
+        self.catalog_label = Gtk.Label(xalign=0, css_classes=["caption", "dim-label"], wrap=True)
+        box.append(self.catalog_label)
+        top.add(box)
 
-        # Row 2: Filter Pills in a Linked Box
-        filter_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-        filter_bar.add_css_class("linked")
-        filter_bar.set_halign(Gtk.Align.START)
+        self.list_group = Adw.PreferencesGroup()
+        self.add(self.list_group)
 
-        filters = [
-            ("All", "ALL"),
-            ("DoH", "DOH"),
-            ("DNSCrypt", "DNSCRYPT"),
-            ("Custom", "CUSTOM"),
-            ("DNSSEC", "DNSSEC"),
-            ("No-Log", "NOLOG"),
-        ]
-        self._filter_buttons = []
-        for label, code in filters:
-            btn = Gtk.Button(label=label)
-            if code == "ALL":
-                btn.add_css_class("suggested-action")
-            btn.connect("clicked", self._on_filter_clicked, code)
-            filter_bar.append(btn)
-            self._filter_buttons.append((btn, code))
-
-        toolbar_box.append(filter_bar)
-        top_group.add(toolbar_box)
-
-        # Resolvers List Group
-        self.resolvers_group = Adw.PreferencesGroup()
-        self.resolvers_group.set_title("Available Resolvers")
-        self.add(self.resolvers_group)
+    # Filters
 
     def _on_search_changed(self, entry):
-        self._search_query = entry.get_text().strip().lower()
-        self.reload_resolvers()
+        self._query = entry.get_text().strip().lower()
+        if self._query and self._scope == "recommended":
+            self._scope = "all_search"
+        elif not self._query and self._scope == "all_search":
+            self._scope = "recommended"
+        self.reload()
 
-    def _on_filter_clicked(self, clicked_btn, code: str):
-        self._protocol_filter = code
-        for btn, c in self._filter_buttons:
-            if c == code:
-                btn.add_css_class("suggested-action")
-            else:
-                btn.remove_css_class("suggested-action")
-        self.reload_resolvers()
+    def _on_scope_toggled(self, btn, code):
+        if btn.get_active():
+            self._scope = code
+            self.reload()
 
-    def reload_resolvers(self):
-        self.remove(self.resolvers_group)
-        self.resolvers_group = Adw.PreferencesGroup()
-        self.resolvers_group.set_title("Available Resolvers")
-        self.add(self.resolvers_group)
+    def _on_proto_changed(self, dd, _pspec):
+        self._proto = ["any", "DoH", "DNSCrypt"][dd.get_selected()]
+        self.reload()
 
-        catalog = get_all_resolvers()
-        # Also include any custom server_names in config not in catalog
-        known_names = {r["name"] for r in catalog}
-        all_resolvers = list(catalog)
+    def _on_usable_toggled(self, btn):
+        self._usable_only = btn.get_active()
+        self.reload()
 
-        for s_name in self.config_mgr.server_names:
-            if s_name not in known_names:
-                all_resolvers.insert(
-                    0,
-                    {
-                        "name": s_name,
-                        "label": f"Custom: {s_name}",
-                        "protocol": "Custom",
-                        "description": "User-defined resolver entry",
-                        "dnssec": False,
-                        "nolog": False,
-                        "nofilter": False,
-                    },
-                )
+    # Rendering
 
-        matched = 0
-        for res in all_resolvers:
-            # Check filter
-            if self._protocol_filter == "DOH" and res["protocol"] != "DoH":
-                continue
-            if self._protocol_filter == "DNSCRYPT" and res["protocol"] != "DNSCrypt":
-                continue
-            if self._protocol_filter == "CUSTOM" and res["protocol"] != "Custom":
-                continue
-            if self._protocol_filter == "DNSSEC" and not res.get("dnssec"):
-                continue
-            if self._protocol_filter == "NOLOG" and not res.get("nolog"):
-                continue
-
-            # Check search
-            if self._search_query:
-                q = self._search_query
-                in_name = q in res["name"].lower()
-                in_label = q in res["label"].lower()
-                in_desc = q in res["description"].lower()
-                if not (in_name or in_label or in_desc):
-                    continue
-
-            matched += 1
-            row = self._create_resolver_row(res)
-            self.resolvers_group.add(row)
-
-        if matched == 0:
-            empty_row = Adw.ActionRow()
-            empty_row.set_title("No resolvers match criteria")
-            empty_row.set_subtitle("Try changing the search term or protocol filter")
-            self.resolvers_group.add(empty_row)
-
-    def _create_resolver_row(self, res: dict) -> Adw.ActionRow:
-        row = Adw.ActionRow()
-        row.set_title(GLib.markup_escape_text(res["label"]))
-        row.set_subtitle(GLib.markup_escape_text(f"{res['name']} — {res['description']}"))
-
-        # Icon prefix
-        icon_name = "network-wireless-symbolic" if res["protocol"] == "DoH" else "security-high-symbolic"
-        icon = Gtk.Image.new_from_icon_name(icon_name)
-        row.add_prefix(icon)
-
-        # Tags Box (Pill Badges)
-        tag_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        tag_box.set_valign(Gtk.Align.CENTER)
-        tag_box.set_margin_end(12)
-
-        proto_lbl = Gtk.Label(label=res["protocol"])
-        proto_lbl.add_css_class("dns-badge")
-        if res["protocol"] == "DoH":
-            proto_lbl.add_css_class("dns-badge-doh")
-        elif res["protocol"] == "DNSCrypt":
-            proto_lbl.add_css_class("dns-badge-dnscrypt")
+    def update_catalog_state(self):
+        state = self.win.catalog_state
+        count = len(self.win.catalog)
+        if state == "loading":
+            text = "Loading the resolver list from dnscrypt-proxy…"
+        elif state == "refreshing":
+            text = f"{count} servers (cached). Refreshing…"
+        elif state.startswith("error"):
+            text = f"Could not load the resolver list ({state[7:]}). " + (f"Showing {count} cached servers." if count else "")
         else:
-            proto_lbl.add_css_class("dns-badge-neutral")
-        tag_box.append(proto_lbl)
+            text = f"{count} servers from dnscrypt-proxy's sources."
+        self.catalog_label.set_text(text)
 
-        if res.get("dnssec"):
-            dnssec_lbl = Gtk.Label(label="DNSSEC")
-            dnssec_lbl.add_css_class("dns-badge")
-            dnssec_lbl.add_css_class("dns-badge-security")
-            tag_box.append(dnssec_lbl)
+    def _entries(self):
+        catalog = self.win.catalog
+        by_name = {r["name"]: r for r in catalog}
+        entries = []
+        for name in self.cfg.server_names:
+            if name in by_name:
+                continue
+            if name in self.cfg.static_stamps:
+                entries.append({"name": name, "label": name, "proto": "Stamp", "description": "Custom server (static stamp)",
+                                "dnssec": False, "nolog": False, "nofilter": False, "ipv6": False, "static": True})
+            else:
+                entries.append({"name": name, "label": name, "proto": "?", "description": "", "missing": True,
+                                "dnssec": False, "nolog": False, "nofilter": False, "ipv6": False})
+        entries.extend(catalog)
+        return entries
 
-        if res.get("nolog"):
-            nolog_lbl = Gtk.Label(label="No-Log")
-            nolog_lbl.add_css_class("dns-badge")
-            nolog_lbl.add_css_class("dns-badge-privacy")
-            tag_box.append(nolog_lbl)
+    def _visible(self, entry) -> bool:
+        selected = entry["name"] in self.cfg.server_names
+        scope = self._scope
+        if scope == "selected" and not selected:
+            return False
+        if scope == "recommended" and not (entry.get("recommended") or selected):
+            return False
+        if self._proto != "any" and entry["proto"] != self._proto:
+            return False
+        if self._usable_only and self._reason(entry):
+            return False
+        if self._query:
+            q = self._query
+            if q not in entry["name"].lower() and q not in entry.get("label", "").lower() and q not in entry.get("description", "").lower():
+                return False
+        return True
 
-        row.add_suffix(tag_box)
+    def _reason(self, entry):
+        if entry.get("static"):
+            return None
+        if entry.get("missing"):
+            if not self.win.catalog:
+                return "Resolver list not loaded yet"
+            return "Not found in the resolver sources; dnscrypt-proxy ignores it"
+        return resolver_db.exclusion_reason(entry, self.cfg)
 
-        # Toggle Switch
-        is_active = res["name"] in self.config_mgr.server_names
-        switch = Gtk.Switch()
-        switch.set_active(is_active)
-        switch.set_valign(Gtk.Align.CENTER)
-        switch.connect("notify::active", self._on_switch_toggled, res["name"])
+    def reload(self):
+        self.update_catalog_state()
+        self.remove(self.list_group)
+        self.list_group = Adw.PreferencesGroup()
+        self.add(self.list_group)
+        self._switches = {}
+
+        shown = 0
+        total = 0
+        for entry in self._entries():
+            if not self._visible(entry):
+                continue
+            total += 1
+            if shown < MAX_ROWS:
+                self.list_group.add(self._create_row(entry))
+                shown += 1
+
+        if not self.cfg.server_names:
+            info = Adw.ActionRow(
+                title="No resolvers selected",
+                subtitle="dnscrypt-proxy picks automatically from every server that meets the requirements.",
+            )
+            info.add_prefix(Gtk.Image.new_from_icon_name("dialog-information-symbolic"))
+            self.list_group.add(info)
+        if total == 0:
+            self.list_group.add(Adw.ActionRow(title="No servers match", subtitle="Change the search or filters"))
+        elif total > shown:
+            self.list_group.set_description(f"Showing {shown} of {total}. Refine the search to see more.")
+
+    def refresh_eligibility(self):
+        """Requirements changed: rebuild rows so warnings are current."""
+        self.reload()
+
+    def _create_row(self, entry) -> Adw.ActionRow:
+        name = entry["name"]
+        row = Adw.ActionRow(title=entry.get("label") or name, use_markup=False)
+        subtitle = name
+        if entry.get("description"):
+            subtitle += f" · {entry['description']}"
+        reason = self._reason(entry)
+        selected = name in self.cfg.server_names
+        if reason:
+            subtitle += f"\n⚠ Skipped: {reason}" if selected else f"\nNot usable: {reason}"
+        row.set_subtitle(subtitle)
+        row.set_subtitle_lines(3)
+        if reason and selected:
+            row.add_css_class("warning")
+
+        badges = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER, margin_end=8)
+        kind = {"DoH": "doh", "DNSCrypt": "dnscrypt"}.get(entry["proto"], "neutral")
+        badges.append(_badge(entry["proto"], kind))
+        if entry.get("dnssec"):
+            badges.append(_badge("DNSSEC", "security"))
+        if entry.get("nolog"):
+            badges.append(_badge("No-log", "privacy"))
+        if not entry.get("missing") and not entry.get("static"):
+            badges.append(_badge("Unfiltered", "neutral") if entry.get("nofilter") else _badge("Filtering", "warning"))
+        row.add_suffix(badges)
+
+        switch = Gtk.Switch(active=selected, valign=Gtk.Align.CENTER)
+        switch.connect("notify::active", self._on_switch_toggled, name)
         row.add_suffix(switch)
-
+        row.set_activatable_widget(switch)
         return row
 
-    def _on_switch_toggled(self, switch, _, name: str):
-        active = switch.get_active()
-        self.config_mgr.toggle_resolver(name, active)
-        self.on_change_cb()
+    def _on_switch_toggled(self, switch, _pspec, name: str):
+        self.cfg.toggle_resolver(name, switch.get_active())
+        self.win.btn_apply.set_visible(self.cfg.is_dirty)
+        self.win.status_view.update_summary()
 
-    def _show_add_custom_dialog(self):
-        dialog = Adw.MessageDialog(
-            transient_for=self.get_root(),
-            heading="Add Custom Upstream Resolver",
-            body="Enter a public resolver identifier (e.g. quad9-doh-ip4-filter-pri, cloudflare) or a plain DNS IP.",
+    def _show_add_stamp_dialog(self):
+        dialog = Adw.AlertDialog(
+            heading="Add Server from Stamp",
+            body="Paste an sdns:// stamp, for example from dnscrypt.info/stamps or your DNS provider.",
         )
-
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        box.set_margin_top(12)
-        box.set_margin_bottom(12)
-
-        entry = Adw.EntryRow()
-        entry.set_title("Resolver Name or Plain DNS IP")
-        entry.set_tooltip_text("e.g. quad9-doh-ip4-filter-pri, cloudflare, or 1.1.1.1:53")
-        box.append(entry)
-
-        hint_lbl = Gtk.Label(
-            label="Tip: For domain-specific Plain DNS routing (YogaDNS style), use the 'Domain Rules' tab.\nPlain DNS IPs entered here will be added to Fallback Resolvers.",
-        )
-        hint_lbl.add_css_class("caption")
-        hint_lbl.add_css_class("dim-label")
-        hint_lbl.set_wrap(True)
-        hint_lbl.set_xalign(0)
-        box.append(hint_lbl)
-
-        dialog.set_extra_child(box)
-
+        entries = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"])
+        name_row = Adw.EntryRow(title="Name (e.g. my-nextdns)")
+        stamp_row = Adw.EntryRow(title="Stamp (sdns://…)")
+        entries.append(name_row)
+        entries.append(stamp_row)
+        dialog.set_extra_child(entries)
         dialog.add_response("cancel", "Cancel")
-        dialog.add_response("add", "Add Resolver")
+        dialog.add_response("add", "Add")
         dialog.set_response_appearance("add", Adw.ResponseAppearance.SUGGESTED)
 
-        def on_response(d, resp_id):
-            if resp_id == "add":
-                val = entry.get_text().strip()
-                if not val:
-                    return
+        def revalidate(*_):
+            ok = True
+            for row, check in ((name_row, validate.resolver_name), (stamp_row, validate.stamp)):
+                try:
+                    check(row.get_text())
+                    row.remove_css_class("error")
+                except ValueError:
+                    ok = False
+                    if row.get_text():
+                        row.add_css_class("error")
+            dialog.set_response_enabled("add", ok)
 
-                import re
-                # Check if it's an IP:port or plain IP
-                if re.match(r"^\d+\.\d+\.\d+\.\d+(:\d+)?$", val) or ":" in val and "." not in val:
-                    if ":" not in val:
-                        val = f"{val}:53"
-                    if val not in self.config_mgr.fallback_resolvers:
-                        self.config_mgr.fallback_resolvers.append(val)
-                        self.config_mgr.set_dirty(True)
-                else:
-                    self.config_mgr.toggle_resolver(val, True)
+        name_row.connect("changed", revalidate)
+        stamp_row.connect("changed", revalidate)
+        revalidate()
 
-                self.reload_resolvers()
-                self.on_change_cb()
+        def on_response(_d, response):
+            if response == "add":
+                self.cfg.add_static_resolver(validate.resolver_name(name_row.get_text()), validate.stamp(stamp_row.get_text()))
+                self._scope = "selected"
+                self.reload()
+                self.win.config_changed()
 
         dialog.connect("response", on_response)
-        dialog.present()
+        dialog.present(self.win)

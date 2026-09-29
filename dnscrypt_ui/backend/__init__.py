@@ -1,6 +1,5 @@
 from .config_manager import ConfigManager, ForwardingRule
-from .service_manager import ServiceManager, ServiceStatus
-from .resolver_db import get_all_resolvers, find_resolver
+from .service_manager import ServiceManager, ServiceStatus, RoutingStatus
 from .query_monitor import QueryMonitor, QueryEntry
 
 __all__ = [
@@ -8,8 +7,7 @@ __all__ = [
     "ForwardingRule",
     "ServiceManager",
     "ServiceStatus",
-    "get_all_resolvers",
-    "find_resolver",
+    "RoutingStatus",
     "QueryMonitor",
     "QueryEntry",
 ]

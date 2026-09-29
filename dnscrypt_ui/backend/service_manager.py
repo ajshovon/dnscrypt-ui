@@ -1,246 +1,337 @@
 """
-Service and Systemd Manager for dnscrypt-proxy.
-Controls systemd services, handles pkexec elevation for configuration
-updates and restarts, detects port 53 conflicts, and benchmarks DNS latency.
+Service and system integration for dnscrypt-proxy.
+
+- Service state and control go through systemd's D-Bus API, so polkit shows
+  its own "manage system services" prompt.
+- Writing configuration and changing system DNS go through the privileged
+  helper (helper/dnscrypt-ui-helper) started with pkexec.
+- DNS routing checks read systemd-resolved over D-Bus and /etc/resolv.conf.
+
+All methods block; call them from worker threads.
 """
 
-import os
-import shlex
-import shutil
+import ipaddress
+import json
+import random
 import socket
+import stat
+import string
 import struct
 import subprocess
-import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
+
+from gi.repository import Gio, GLib
+
+SERVICE = "dnscrypt-proxy.service"
+INSTALLED_HELPER = Path("/usr/local/libexec/dnscrypt-ui-helper")
+BUNDLED_HELPER = Path(__file__).resolve().parents[2] / "helper" / "dnscrypt-ui-helper"
+STUB_ADDRESSES = {"127.0.0.53", "127.0.0.54"}
 
 
 @dataclass
 class ServiceStatus:
     installed: bool
     active: bool
-    status_str: str  # "active", "inactive", "failed", "not-installed"
-    substate: str
-    pid: int
-    uptime_sec: int
+    status_str: str  # ActiveState: active, inactive, failed, activating, ...
+    substate: str = ""
+    pid: int = 0
+    error: str = ""
+
+    @property
+    def transitioning(self) -> bool:
+        return self.status_str in ("activating", "deactivating", "reloading")
+
+
+@dataclass
+class RoutingStatus:
+    protected: bool
+    problems: List[str] = field(default_factory=list)
+    checked: bool = True
+
+
+@dataclass
+class DnsResult:
+    ok: bool
+    latency_ms: float = 0.0
+    rcode: int = -1
+    addresses: List[str] = field(default_factory=list)
     error: str = ""
 
 
+def split_host_port(addr: str) -> Tuple[str, int]:
+    addr = addr.strip()
+    if addr.startswith("["):
+        host, _, port = addr[1:].partition("]:")
+        return host, int(port or 53)
+    if addr.count(":") == 1:
+        host, port = addr.split(":")
+        return host, int(port)
+    return addr, 53
+
+
+def probe_target(listen_addresses: List[str]) -> Tuple[str, int]:
+    """Address to send test queries to, derived from listen_addresses."""
+    host, port = split_host_port(listen_addresses[0] if listen_addresses else "127.0.0.1:53")
+    ip = ipaddress.ip_address(host)
+    if ip.is_unspecified:
+        host = "::1" if ip.version == 6 else "127.0.0.1"
+    return host, port
+
+
 class ServiceManager:
-    SERVICE_NAME = "dnscrypt-proxy"
-
     def __init__(self):
-        self._installed = self.check_installed()
+        self._bus: Optional[Gio.DBusConnection] = None
 
-    def check_installed(self) -> bool:
-        return bool(
-            shutil.which("dnscrypt-proxy")
-            or Path("/usr/bin/dnscrypt-proxy").exists()
-            or Path("/usr/sbin/dnscrypt-proxy").exists()
-        )
+    # systemd
+
+    def _system_bus(self) -> Gio.DBusConnection:
+        if self._bus is None:
+            self._bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        return self._bus
 
     def get_status(self) -> ServiceStatus:
-        if not self.check_installed():
-            return ServiceStatus(
-                installed=False,
-                active=False,
-                status_str="not-installed",
-                substate="",
-                pid=0,
-                uptime_sec=0,
-                error="dnscrypt-proxy binary not found",
-            )
-
         try:
             res = subprocess.run(
-                [
-                    "systemctl",
-                    "show",
-                    self.SERVICE_NAME,
-                    "--property=ActiveState,SubState,MainPID,ExecMainStartTimestampMonotonic",
-                ],
+                ["systemctl", "show", SERVICE, "--property=LoadState,ActiveState,SubState,MainPID"],
                 capture_output=True,
                 text=True,
-                timeout=3,
+                timeout=5,
             )
-            props = {}
-            for line in res.stdout.splitlines():
-                if "=" in line:
-                    k, v = line.split("=", 1)
-                    props[k.strip()] = v.strip()
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return ServiceStatus(installed=False, active=False, status_str="error", error=str(e))
+        props = dict(l.split("=", 1) for l in res.stdout.splitlines() if "=" in l)
+        installed = props.get("LoadState") == "loaded"
+        state = props.get("ActiveState", "inactive")
+        return ServiceStatus(
+            installed=installed,
+            active=installed and state == "active",
+            status_str=state if installed else "not-installed",
+            substate=props.get("SubState", ""),
+            pid=int(props.get("MainPID", "0") or 0),
+        )
 
-            active_state = props.get("ActiveState", "inactive")
-            substate = props.get("SubState", "")
-            pid = int(props.get("MainPID", 0) or 0)
-            is_active = active_state == "active"
-
-            return ServiceStatus(
-                installed=True,
-                active=is_active,
-                status_str=active_state,
-                substate=substate,
-                pid=pid,
-                uptime_sec=0,
+    def _unit_call(self, method: str) -> Tuple[bool, str]:
+        try:
+            self._system_bus().call_sync(
+                "org.freedesktop.systemd1",
+                "/org/freedesktop/systemd1",
+                "org.freedesktop.systemd1.Manager",
+                method,
+                GLib.Variant("(ss)", (SERVICE, "replace")),
+                None,
+                Gio.DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION,
+                120000,
+                None,
             )
-        except Exception as e:
-            return ServiceStatus(
-                installed=True,
-                active=False,
-                status_str="error",
-                substate="",
-                pid=0,
-                uptime_sec=0,
-                error=str(e),
-            )
+            return True, ""
+        except GLib.Error as e:
+            msg = Gio.DBusError.get_remote_error(e) or ""
+            if "AccessDenied" in msg or "InteractiveAuthorizationRequired" in msg:
+                return False, "Authorization was cancelled or denied"
+            return False, e.message
 
     def start(self) -> Tuple[bool, str]:
-        return self._run_systemctl("start")
+        return self._unit_call("StartUnit")
 
     def stop(self) -> Tuple[bool, str]:
-        return self._run_systemctl("stop")
+        return self._unit_call("StopUnit")
 
     def restart(self) -> Tuple[bool, str]:
-        return self._run_systemctl("restart")
+        return self._unit_call("RestartUnit")
 
-    def _run_systemctl(self, action: str) -> Tuple[bool, str]:
-        try:
-            res = subprocess.run(
-                ["pkexec", "systemctl", action, self.SERVICE_NAME],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if res.returncode == 0:
-                return True, ""
-            return False, res.stderr or res.stdout or f"Failed with exit code {res.returncode}"
-        except Exception as e:
-            return False, str(e)
-
-    def apply_and_restart(self, staged_files: Dict[Path, str]) -> Tuple[bool, str]:
-        """
-        Atomically copies staged files to target system paths and restarts
-        the service using a single pkexec prompt.
-        Uses a secure random temp directory to prevent symlink attacks.
-        """
-        staging_dir = None
-        try:
-            staging_dir = Path(tempfile.mkdtemp(prefix="dnscrypt_ui_"))
-            os.chmod(staging_dir, 0o700)
-
-            script_lines = ["#!/usr/bin/env bash", "set -e"]
-
-            for dest_path, content in staged_files.items():
-                staging_file = staging_dir / dest_path.name
-                with open(staging_file, "w", encoding="utf-8") as f:
-                    f.write(content)
-                os.chmod(staging_file, 0o644)
-
-                script_lines.append(f"mkdir -p {shlex.quote(str(dest_path.parent))}")
-                script_lines.append(f"cp {shlex.quote(str(staging_file))} {shlex.quote(str(dest_path))}")
-                script_lines.append(f"chmod 644 {shlex.quote(str(dest_path))}")
-
-            if self.check_installed():
-                script_lines.append(f"systemctl restart {shlex.quote(self.SERVICE_NAME)}")
-
-            script_path = staging_dir / "apply.sh"
-            with open(script_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(script_lines) + "\n")
-            script_path.chmod(0o755)
-
-            try:
-                res = subprocess.run(
-                    ["pkexec", str(script_path)],
-                    capture_output=True,
-                    text=True,
-                    timeout=45,
-                )
-                if res.returncode == 0:
-                    return True, ""
-                return False, res.stderr or res.stdout or f"Apply failed with code {res.returncode}"
-            except Exception as e:
-                return False, str(e)
-        finally:
-            if staging_dir and staging_dir.exists():
-                import shutil as _shutil
-                _shutil.rmtree(staging_dir, ignore_errors=True)
-
-    def check_port_53_conflict(self) -> Tuple[bool, str]:
-        """
-        Checks whether port 53 is being occupied by another service like systemd-resolved.
-        Returns (has_conflict, description_of_listener).
-        """
-        try:
-            res = subprocess.run(
-                ["ss", "-tlunp", "sport = :53"],
-                capture_output=True,
-                text=True,
-                timeout=2,
-            )
-            output = res.stdout.strip()
-            if not output:
-                return False, ""
-
-            # Check if non-dnscrypt process is listening
-            lines = output.splitlines()[1:]  # skip header
-            listeners = []
-            for l in lines:
-                if "dnscrypt-proxy" not in l:
-                    listeners.append(l)
-
-            if listeners:
-                if any("systemd-resolve" in l for l in listeners):
-                    return True, "systemd-resolved is currently listening on port 53"
-                return True, f"Port 53 is used by: {listeners[0][:60]}"
-            return False, ""
-        except Exception:
-            return False, ""
+    # Privileged helper
 
     @staticmethod
-    def test_dns_latency(
-        server: str = "127.0.0.1", port: int = 53, domain: str = "cloudflare.com", timeout: float = 2.5
-    ) -> Tuple[bool, float, str]:
-        """
-        Sends an RFC-compliant DNS A record query packet to test resolution and latency.
-        Returns (success, latency_ms, resolved_ip_or_error).
-        """
-        tid = 0x5678
-        flags = 0x0100  # standard query, recursion desired
-        qdcount = 1
-        header = struct.pack(">HHHHHH", tid, flags, qdcount, 0, 0, 0)
-
-        qname = b""
-        for part in domain.split("."):
-            if not part:
-                continue
-            qname += bytes([len(part)]) + part.encode("ascii")
-        qname += b"\x00"
-        question = qname + struct.pack(">HH", 1, 1)  # Type A, Class IN
-        packet = header + question
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(timeout)
-        start = time.perf_counter()
+    def helper_installed() -> bool:
+        """True when the helper is installed root-owned and not writable by others."""
         try:
-            sock.sendto(packet, (server, port))
-            resp, _ = sock.recvfrom(512)
+            st = INSTALLED_HELPER.stat()
+        except OSError:
+            return False
+        return st.st_uid == 0 and not st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+
+    def _helper_argv(self) -> List[str]:
+        if self.helper_installed():
+            return ["pkexec", str(INSTALLED_HELPER)]
+        # Development fallback: runs the helper from the source tree
+        return ["pkexec", "/usr/bin/python3", "-I", str(BUNDLED_HELPER)]
+
+    def run_helper(self, args: List[str], stdin: Optional[str] = None) -> Dict:
+        try:
+            res = subprocess.run(
+                self._helper_argv() + args,
+                input=stdin,
+                capture_output=True,
+                text=True,
+                timeout=240,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return {"ok": False, "message": str(e)}
+        if res.returncode in (126, 127) and not res.stdout.strip():
+            return {"ok": False, "message": "Authorization was cancelled or denied"}
+        try:
+            return json.loads(res.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            return {"ok": False, "message": (res.stderr or res.stdout or f"exit code {res.returncode}").strip()[-400:]}
+
+    def apply(self, staged: Dict[str, str]) -> Dict:
+        return self.run_helper(["apply"], stdin=json.dumps(staged))
+
+    def setup_system_dns(self, listen_address: str) -> Dict:
+        return self.run_helper(["setup-dns", listen_address])
+
+    def undo_system_dns(self) -> Dict:
+        return self.run_helper(["undo-dns"])
+
+    # DNS routing
+
+    def check_routing(self, listen_addresses: List[str]) -> RoutingStatus:
+        """Is every DNS query on this machine going through dnscrypt-proxy?"""
+        problems: List[str] = []
+        proxy_host, proxy_port = probe_target(listen_addresses)
+        listen_hosts = {split_host_port(a)[0] for a in listen_addresses}
+
+        nameservers = []
+        try:
+            for line in Path("/etc/resolv.conf").read_text().splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == "nameserver":
+                    nameservers.append(parts[1])
+        except OSError as e:
+            problems.append(f"Cannot read /etc/resolv.conf: {e}")
+
+        uses_stub = any(ns in STUB_ADDRESSES for ns in nameservers)
+        for ns in nameservers:
+            if ns in STUB_ADDRESSES:
+                continue
+            if ns in listen_hosts and proxy_port == 53:
+                continue
+            problems.append(f"/etc/resolv.conf sends queries straight to {ns}, bypassing dnscrypt-proxy")
+
+        if uses_stub:
+            try:
+                problems += self._resolved_problems(proxy_host, proxy_port)
+            except GLib.Error as e:
+                problems.append(f"systemd-resolved is not reachable: {e.message}")
+
+        return RoutingStatus(protected=not problems, problems=problems)
+
+    def _resolved_problems(self, proxy_host: str, proxy_port: int) -> List[str]:
+        bus = self._system_bus()
+
+        def get(path, iface, prop):
+            return bus.call_sync(
+                "org.freedesktop.resolve1", path, "org.freedesktop.DBus.Properties", "Get",
+                GLib.Variant("(ss)", (iface, prop)), None, Gio.DBusCallFlags.NONE, 3000, None,
+            ).unpack()[0]
+
+        def fmt(family, raw, port=0):
+            ip = ipaddress.ip_address(bytes(raw))
+            return f"{ip}:{port}" if port else str(ip)
+
+        problems = []
+        servers = get("/org/freedesktop/resolve1", "org.freedesktop.resolve1.Manager", "DNSEx")
+        global_ok = False
+        links: Dict[int, List[str]] = {}
+        # Global servers are reported with ifindex 0, or with the loopback index
+        # on newer systemd; resolved never accepts per-link DNS on loopback.
+        global_indexes = {0} | {i for i, n in socket.if_nameindex() if n == "lo"}
+        for ifindex, family, raw, port, _name in servers:
+            ip = str(ipaddress.ip_address(bytes(raw)))
+            if ifindex in global_indexes:
+                if ip == str(ipaddress.ip_address(proxy_host)) and (port or 53) == proxy_port:
+                    global_ok = True
+            else:
+                links.setdefault(ifindex, []).append(fmt(family, raw, port))
+
+        if not global_ok:
+            problems.append(f"systemd-resolved does not forward to dnscrypt-proxy ({proxy_host}:{proxy_port})")
+
+        for ifindex, addrs in links.items():
+            path = bus.call_sync(
+                "org.freedesktop.resolve1", "/org/freedesktop/resolve1",
+                "org.freedesktop.resolve1.Manager", "GetLink",
+                GLib.Variant("(i)", (ifindex,)), None, Gio.DBusCallFlags.NONE, 3000, None,
+            ).unpack()[0]
+            if not get(path, "org.freedesktop.resolve1.Link", "DefaultRoute"):
+                continue  # only used for its own routing domains (e.g. a VPN)
+            try:
+                name = socket.if_indextoname(ifindex)
+            except OSError:
+                name = f"#{ifindex}"
+            problems.append(
+                f"Network {name} has its own DNS ({', '.join(addrs)}); queries also go there unencrypted"
+            )
+        return problems
+
+    # DNS testing
+
+    @staticmethod
+    def dns_query(host: str, port: int, name: str, qtype: int = 1, timeout: float = 3.0) -> DnsResult:
+        tid = random.randint(0, 0xFFFF)
+        qname = b"".join(bytes([len(p)]) + p.encode("ascii") for p in name.strip(".").split(".")) + b"\x00"
+        packet = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0) + qname + struct.pack(">HH", qtype, 1)
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        with socket.socket(family, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(timeout)
+            start = time.perf_counter()
+            try:
+                sock.sendto(packet, (host, port))
+                while True:
+                    resp, _ = sock.recvfrom(4096)
+                    if len(resp) >= 12 and struct.unpack(">H", resp[:2])[0] == tid:
+                        break
+            except socket.timeout:
+                return DnsResult(ok=False, error="Query timed out")
+            except OSError as e:
+                return DnsResult(ok=False, error=e.strerror or str(e))
             latency = (time.perf_counter() - start) * 1000.0
 
-            # Verify response ID matches
-            if len(resp) >= 12:
-                resp_tid, resp_flags, qdc, anc, _, _ = struct.unpack(">HHHHHH", resp[:12])
-                rcode = resp_flags & 0x000F
-                if rcode != 0:
-                    return False, latency, f"DNS Error code: {rcode}"
-                if anc > 0 and len(resp) >= 16:
-                    resolved_ip = socket.inet_ntoa(resp[-4:])
-                    return True, latency, resolved_ip
+        _, flags, qd, an, _, _ = struct.unpack(">HHHHHH", resp[:12])
+        rcode = flags & 0x000F
+        return DnsResult(ok=True, latency_ms=latency, rcode=rcode, addresses=_parse_a_records(resp, qd, an))
 
-            return True, latency, "Resolved (no A record)"
-        except socket.timeout:
-            return False, 0.0, "Query timed out"
-        except Exception as e:
-            return False, 0.0, str(e)
-        finally:
-            sock.close()
+    def test_resolution(self, listen_addresses: List[str]) -> Tuple[DnsResult, DnsResult]:
+        """
+        Returns (lookup, upstream):
+        - lookup: resolves cloudflare.com (may come from cache)
+        - upstream: a random name that cannot be cached, so the time is a real
+          round trip through the encrypted upstream
+        """
+        host, port = probe_target(listen_addresses)
+        lookup = self.dns_query(host, port, "cloudflare.com")
+        label = "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
+        upstream = self.dns_query(host, port, f"{label}.example.com", timeout=5.0)
+        return lookup, upstream
+
+
+def _skip_name(buf: bytes, pos: int) -> int:
+    while pos < len(buf):
+        length = buf[pos]
+        if length == 0:
+            return pos + 1
+        if length & 0xC0 == 0xC0:
+            return pos + 2
+        pos += length + 1
+    return pos
+
+
+def _parse_a_records(resp: bytes, qdcount: int, ancount: int) -> List[str]:
+    pos = 12
+    try:
+        for _ in range(qdcount):
+            pos = _skip_name(resp, pos) + 4
+        found = []
+        for _ in range(ancount):
+            pos = _skip_name(resp, pos)
+            rtype, _, _, rdlen = struct.unpack(">HHIH", resp[pos:pos + 10])
+            pos += 10
+            if rtype == 1 and rdlen == 4:
+                found.append(socket.inet_ntoa(resp[pos:pos + 4]))
+            pos += rdlen
+        return found
+    except (struct.error, IndexError):
+        return []

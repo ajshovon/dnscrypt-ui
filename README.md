@@ -1,114 +1,80 @@
 # DNSCrypt UI
 
-A modern, native **GNOME / Libadwaita** graphical desktop interface for **`dnscrypt-proxy`** designed specifically for Fedora and Linux.
+A GNOME / Libadwaita interface for **`dnscrypt-proxy`** on Fedora and other Linux distributions.
 
-It brings the powerful, rule-based DNS features of **YogaDNS** to Linux:
-- **YogaDNS-style Split-DNS Domain Routing**: Route specific domains and wildcards (`*.internal`, `*.lan`, `google.com`) to designated DNS servers (plain DNS, local gateway, or custom upstreams).
-- **Encrypted Resolvers Catalog**: Browse, filter, and activate upstream **DNS-over-HTTPS (DoH)** and **DNSCrypt** servers (Quad9, Cloudflare, AdGuard, Google, Mullvad, NextDNS, etc.) with security/logging badges.
-- **Live DNS Query Inspector**: Real-time traffic monitor with latency, domain filtering, and resolution/blocking status.
-- **Service & Systemd Control**: Start, stop, and restart `dnscrypt-proxy` with a single PolicyKit prompt.
-- **DNS Resolution Benchmark**: Built-in test query tool measuring latency through `127.0.0.1:53`.
+- **System DNS protection**: checks that every application actually resolves through dnscrypt-proxy (no leaks to DHCP/router DNS), and fixes it in one click.
+- **Resolvers**: pick encrypted DoH / DNSCrypt upstreams from the list dnscrypt-proxy itself loads, see why a server would be skipped (no-log, no-filter, DNSSEC, protocol), or add your own `sdns://` stamp.
+- **Domain Rules (split DNS)**: send a domain and its subdomains to a specific DNS server, e.g. `lan → $DHCP` or `corp.example → 10.0.0.53`.
+- **Query Log**: live view of dnscrypt-proxy's query log with blocked/error highlighting.
+- **Safe apply**: changes are validated with `dnscrypt-proxy -check`, backed up, and rolled back automatically if the service does not come up.
 
----
+## Install
 
-## Screenshots & Highlights
-
-- **Dashboard**: Live daemon status (active/stopped/PID), DNS query latency benchmark, and Fedora port 53 conflict detector.
-- **Domain Rules (Split-DNS)**: YogaDNS rules tab equivalent. Add, edit, toggle, and delete rules like `*.work.internal 10.0.0.53` or `*.lan 192.168.1.1:53`.
-- **Resolvers**: Filter by DoH, DNSCrypt, DNSSEC validation, and No-Log policies. Toggle servers on and off or add custom stamps.
-- **Query Inspector**: Stream queries in real time, filter by keyword, pause/resume, and inspect blocked/allowed traffic.
-- **One-Click Apply**: Batches config changes and restarts the system service with a single Polkit authentication popup.
-
----
-
-## Getting Started on Fedora GNOME
-
-### 1. Install `dnscrypt-proxy`
-On Fedora, install the official package:
 ```bash
 sudo dnf install dnscrypt-proxy
-```
-
-### 2. Handle Fedora's `systemd-resolved` Conflict
-Fedora runs `systemd-resolved` on port `53` (`127.0.0.53:53`) by default. To let `dnscrypt-proxy` bind to `127.0.0.1:53` and receive system queries:
-
-1. Create a drop-in configuration for `systemd-resolved`:
-   ```bash
-   sudo mkdir -p /etc/systemd/resolved.conf.d
-   sudo tee /etc/systemd/resolved.conf.d/dnscrypt.conf << 'EOF'
-   [Resolve]
-   DNS=127.0.0.1
-   DNSStubListener=no
-   EOF
-   ```
-2. Restart `systemd-resolved`:
-   ```bash
-   sudo systemctl restart systemd-resolved
-   ```
-3. Enable and start `dnscrypt-proxy`:
-   ```bash
-   sudo systemctl enable --now dnscrypt-proxy
-   ```
-
-*(Note: The app's **Dashboard** and **Settings** tabs will detect this conflict automatically and provide this exact guide if needed).*
-
----
-
-## Running & Installing DNSCrypt UI
-
-### Run Directly
-To launch without installing:
-```bash
 cd dns-crypt-ui
-./run.sh
+./install.sh          # user install + root-owned helper and polkit action (asks for sudo)
+./install.sh --user-only   # skip the helper (the app then runs it from this folder)
 ```
 
-### Install into GNOME App Drawer
-To install the application icon, desktop launcher, and binary into your user environment:
-```bash
-cd dns-crypt-ui
-./install.sh
+Run without installing: `./run.sh`. Run the tests: `python3 -m unittest discover -s tests -v`.
+
+## Routing system DNS through dnscrypt-proxy
+
+Installing dnscrypt-proxy does not make applications use it. On Fedora, `/etc/resolv.conf` points at systemd-resolved, which uses the DNS servers your network hands out via DHCP. The Dashboard shows whether queries leak and offers **Fix**, which does the equivalent of:
+
+```ini
+# /etc/systemd/resolved.conf.d/zz-dnscrypt-ui.conf
+[Resolve]
+DNS=127.0.0.1
+Domains=~.
+FallbackDNS=
+DNSOverTLS=no
+DNSStubListener=yes
+
+# /etc/NetworkManager/conf.d/90-dnscrypt-ui.conf
+[main]
+dns=none
 ```
-Once installed, press `Super` (Windows key) on GNOME and search for **DNSCrypt UI**!
 
----
+It also makes `/etc/resolv.conf` a link to the systemd-resolved stub, then reloads NetworkManager and restarts systemd-resolved. Without the NetworkManager part, systemd-resolved keeps sending queries to the DHCP server in parallel, and they leak unencrypted.
 
-## How Split-DNS Domain Routing Works (YogaDNS Replacement)
+**Undo** on the Dashboard removes both files.
 
-In the **Domain Rules** tab:
-1. Click **Add Rule**.
-2. Enter a domain or wildcard pattern (e.g., `*.lan`, `*.corp.internal`, or `reddit.com`).
-3. Select a preset (e.g. `Local Router (192.168.1.1:53)`) or type custom IP addresses.
-4. Click **Add Rule** and then click **Apply & Restart** in the top header bar.
+> Older versions of this README said to set `DNSStubListener=no`. That left the router's DNS in `/etc/resolv.conf` and leaked queries. **Fix** removes that old `dnscrypt.conf` drop-in.
 
-Behind the scenes, this updates `/etc/dnscrypt-proxy/forwarding-rules.txt` and `/etc/dnscrypt-proxy/dnscrypt-proxy.toml` seamlessly.
+## How changes are applied
 
----
+The app never runs code as root from your home directory or `/tmp` once the helper is installed:
 
-## Project Structure
+1. The new `dnscrypt-proxy.toml` and `forwarding-rules.txt` are sent to `/usr/local/libexec/dnscrypt-ui-helper` over stdin, through `pkexec` (polkit action `io.github.shovon.DNSCryptUI.helper`).
+2. The helper only writes files directly inside `/etc/dnscrypt-proxy`, keeps the last 10 versions in `/etc/dnscrypt-proxy/.dnscrypt-ui-backup/`, and runs `dnscrypt-proxy -check`.
+3. It restarts the service and restores the previous files if it does not stay up.
+
+Starting and stopping the service uses systemd's D-Bus API and its own polkit prompt.
+
+Editing keeps your comments and every setting the UI does not manage. Only changed keys are rewritten.
+
+## Limitations
+
+Domain Rules use dnscrypt-proxy's `forwarding_rules`, which can only forward to **plain DNS** servers (`IP[:port]`, `$DHCP`, `$BOOTSTRAP`). You cannot send one domain to a different *encrypted* resolver, which YogaDNS can do. The app warns when a rule sends queries to a public server unencrypted.
+
+## Project structure
 
 ```text
 dns-crypt-ui/
-├── bin/
-│   └── dnscrypt-ui             # Executable launcher
-├── data/
-│   ├── icons/
-│   │   └── io.github.shovon.DNSCryptUI.svg  # Adwaita vector icon
-│   └── io.github.shovon.DNSCryptUI.desktop  # Desktop entry
+├── bin/dnscrypt-ui                 # launcher
+├── helper/dnscrypt-ui-helper       # privileged helper (standalone, runs as root)
+├── data/                           # desktop entry, icon, polkit policy
 ├── dnscrypt_ui/
-│   ├── app.py                  # Main Adw.Application and Window
+│   ├── app.py                      # Adw.Application and main window
 │   ├── backend/
-│   │   ├── config_manager.py   # Surgical TOML & forwarding-rules parser
-│   │   ├── query_monitor.py    # Real-time query.log streamer
-│   │   ├── resolver_db.py      # Curated DoH & DNSCrypt catalog
-│   │   └── service_manager.py  # Systemd & Polkit manager, DNS tester
-│   └── views/
-│       ├── status_view.py      # Service dashboard & DNS benchmark
-│       ├── rules_view.py       # YogaDNS Split-DNS rules manager
-│       ├── resolvers_view.py   # Upstream DoH/DNSCrypt resolvers
-│       ├── query_log_view.py   # Live query inspector
-│       └── settings_view.py    # Network & Fedora integration guide
-├── install.sh                  # Installer for GNOME desktop integration
-├── run.sh                      # Quick runner script
-└── README.md
+│   │   ├── config_manager.py       # dnscrypt-proxy.toml + forwarding-rules.txt model
+│   │   ├── tomledit.py             # comment-preserving TOML editor
+│   │   ├── validate.py             # input validation
+│   │   ├── resolver_db.py          # resolver catalog from `dnscrypt-proxy -list-all -json`
+│   │   ├── service_manager.py      # systemd, helper, leak check, DNS tests
+│   │   └── query_monitor.py        # query log tailer
+│   └── views/                      # Dashboard, Domain Rules, Resolvers, Query Log, Settings
+└── tests/test_backend.py
 ```

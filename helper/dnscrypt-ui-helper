@@ -1,0 +1,351 @@
+#!/usr/bin/python3 -I
+"""
+Privileged helper for DNSCrypt UI. Runs as root through pkexec.
+
+Commands:
+  apply            Read {"toml": ..., "rules": ...} JSON from stdin, validate,
+                   back up, write, check with dnscrypt-proxy, restart, and
+                   roll back when the service does not come up.
+  setup-dns ADDR   Route all system DNS through dnscrypt-proxy at ADDR
+                   (loopback ip:port) via systemd-resolved, without leaks.
+  undo-dns         Remove the DNS routing set up by setup-dns.
+
+Writes a single JSON object to stdout: {"ok": bool, "message": str, ...}.
+This file is standalone (no imports from the app) so it can be installed
+root-owned outside the user's reach.
+"""
+
+import ipaddress
+import json
+import os
+import random
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+from pathlib import Path
+
+CONFIG_DIR = Path("/etc/dnscrypt-proxy")
+TOML_NAME = "dnscrypt-proxy.toml"
+BACKUP_DIR = CONFIG_DIR / ".dnscrypt-ui-backup"
+LOG_DIR = Path("/var/log/dnscrypt-proxy")
+CACHE_DIR = Path("/var/cache/dnscrypt-proxy")
+SERVICE = "dnscrypt-proxy.service"
+BINARY = "/usr/bin/dnscrypt-proxy"
+
+RESOLVED_DROPIN = Path("/etc/systemd/resolved.conf.d/zz-dnscrypt-ui.conf")
+LEGACY_RESOLVED_DROPIN = Path("/etc/systemd/resolved.conf.d/dnscrypt.conf")
+NM_DROPIN = Path("/etc/NetworkManager/conf.d/90-dnscrypt-ui.conf")
+RESOLV_CONF = Path("/etc/resolv.conf")
+STUB_RESOLV = "../run/systemd/resolve/stub-resolv.conf"
+
+MAX_INPUT = 4 * 1024 * 1024
+KEEP_BACKUPS = 10
+
+
+class HelperError(Exception):
+    def __init__(self, message, **extra):
+        super().__init__(message)
+        self.extra = extra
+
+
+def run(argv, timeout=60, check=False):
+    res = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    if check and res.returncode != 0:
+        raise HelperError(f"{' '.join(argv)} failed: {(res.stderr or res.stdout).strip()[-400:]}")
+    return res
+
+
+def restorecon(*paths):
+    if shutil.which("restorecon"):
+        run(["restorecon", "-R", *[str(p) for p in paths]])
+
+
+def atomic_write(path: Path, content: str, mode=0o644):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    restorecon(path)
+
+
+def inside(path: Path, directory: Path) -> bool:
+    try:
+        path.resolve().relative_to(directory.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+# apply
+
+def rules_path_for(parsed: dict) -> Path:
+    raw = str(parsed.get("forwarding_rules", "forwarding-rules.txt"))
+    p = Path(raw)
+    p = p if p.is_absolute() else CONFIG_DIR / p
+    if p.is_symlink() or not inside(p, CONFIG_DIR) or p.parent.resolve() != CONFIG_DIR.resolve():
+        raise HelperError(f"forwarding_rules must name a file directly inside {CONFIG_DIR}")
+    return p
+
+
+def validate_input(data) -> tuple:
+    if not isinstance(data, dict) or not isinstance(data.get("toml"), str) or not isinstance(data.get("rules"), str):
+        raise HelperError("Expected JSON object with string fields 'toml' and 'rules'")
+    try:
+        parsed = tomllib.loads(data["toml"])
+    except tomllib.TOMLDecodeError as e:
+        raise HelperError(f"New configuration is not valid TOML: {e}")
+    return parsed, rules_path_for(parsed)
+
+
+def backup(paths) -> Path:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dest = BACKUP_DIR / stamp
+    n = 1
+    while dest.exists():
+        dest = BACKUP_DIR / f"{stamp}-{n}"
+        n += 1
+    dest.mkdir(parents=True, mode=0o700)
+    for p in paths:
+        if p.exists() and not p.is_symlink():
+            shutil.copy2(p, dest / p.name)
+    old = sorted(d for d in BACKUP_DIR.iterdir() if d.is_dir())
+    for d in old[:-KEEP_BACKUPS]:
+        shutil.rmtree(d, ignore_errors=True)
+    return dest
+
+
+def restore(backup_dir: Path, paths):
+    for p in paths:
+        saved = backup_dir / p.name
+        if saved.exists():
+            atomic_write(p, saved.read_text(encoding="utf-8"))
+        elif p.exists():
+            p.unlink()
+
+
+def ensure_dirs(parsed: dict):
+    qfile = (parsed.get("query_log") or {}).get("file")
+    for directory in (LOG_DIR, CACHE_DIR):
+        wanted = directory == CACHE_DIR or (qfile and inside(Path(qfile), LOG_DIR))
+        if wanted and not directory.exists():
+            directory.mkdir(parents=True, mode=0o755)
+            restorecon(directory)
+
+
+def service_state():
+    res = run(["systemctl", "show", SERVICE, "--property=ActiveState,SubState"], timeout=10)
+    props = dict(l.split("=", 1) for l in res.stdout.splitlines() if "=" in l)
+    return props.get("ActiveState", ""), props.get("SubState", "")
+
+
+def dns_probe(addr: str, timeout: float) -> bool:
+    host, port = parse_addr(addr)
+    if host.is_unspecified:
+        host = ipaddress.ip_address("::1" if host.version == 6 else "127.0.0.1")
+    family = socket.AF_INET6 if host.version == 6 else socket.AF_INET
+    tid = random.randint(0, 0xFFFF)
+    packet = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0) + b"\x00\x00\x02\x00\x01"  # . NS
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with socket.socket(family, socket.SOCK_DGRAM) as s:
+            s.settimeout(1.0)
+            try:
+                s.sendto(packet, (str(host), port))
+                resp, _ = s.recvfrom(512)
+                if len(resp) >= 2 and struct.unpack(">H", resp[:2])[0] == tid:
+                    return True
+            except OSError:
+                pass
+        time.sleep(0.5)
+    return False
+
+
+def cmd_apply():
+    raw = sys.stdin.read(MAX_INPUT + 1)
+    if len(raw) > MAX_INPUT:
+        raise HelperError("Input too large")
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        raise HelperError("Input is not JSON")
+    parsed, rules_path = validate_input(data)
+    toml_path = CONFIG_DIR / TOML_NAME
+    targets = [toml_path, rules_path]
+
+    saved = backup(targets)
+    ensure_dirs(parsed)
+    atomic_write(rules_path, data["rules"])
+    atomic_write(toml_path, data["toml"])
+
+    check = run([BINARY, "-config", str(toml_path), "-check"], timeout=90)
+    if check.returncode != 0:
+        restore(saved, targets)
+        raise HelperError(
+            "dnscrypt-proxy rejected the new configuration. Nothing was changed.",
+            stage="check",
+            output=(check.stderr or check.stdout).strip()[-1500:],
+        )
+
+    run(["systemctl", "restart", SERVICE], timeout=60)
+    # Type=simple units report "active" right after fork, so require the
+    # process to stay up for a few seconds before trusting it.
+    deadline = time.monotonic() + 20
+    active_since = None
+    stable = False
+    while time.monotonic() < deadline:
+        if service_state()[0] == "active":
+            active_since = active_since or time.monotonic()
+            if time.monotonic() - active_since >= 3:
+                stable = True
+                break
+        else:
+            active_since = None
+        time.sleep(0.5)
+
+    if not stable:
+        journal = run(["journalctl", "-u", SERVICE, "-n", "15", "--no-pager", "-o", "cat"], timeout=10).stdout
+        restore(saved, targets)
+        run(["systemctl", "restart", SERVICE], timeout=60)
+        raise HelperError(
+            "dnscrypt-proxy did not start with the new configuration. The previous configuration was restored.",
+            stage="restart",
+            output=journal.strip()[-1500:],
+        )
+
+    listen = parsed.get("listen_addresses") or ["127.0.0.1:53"]
+    answering = dns_probe(listen[0], timeout=15) if listen else False
+    return {
+        "ok": True,
+        "message": "Configuration applied and dnscrypt-proxy restarted",
+        "answering": answering,
+        "backup": str(saved),
+    }
+
+
+# DNS routing
+
+def parse_addr(addr: str):
+    addr = addr.strip()
+    if addr.startswith("["):
+        host, _, port = addr[1:].partition("]:")
+    elif addr.count(":") == 1:
+        host, port = addr.split(":")
+    else:
+        host, port = addr, "53"
+    try:
+        return ipaddress.ip_address(host), int(port or 53)
+    except ValueError:
+        raise HelperError(f"Invalid address: {addr}")
+
+
+def cmd_setup_dns(addr: str):
+    host, port = parse_addr(addr)
+    if not host.is_loopback:
+        raise HelperError("dnscrypt-proxy must listen on a loopback address to be used as system DNS")
+    dns = f"[{host}]:{port}" if host.version == 6 else f"{host}:{port}"
+    if port == 53:
+        dns = str(host)
+
+    backup_dir = backup([RESOLVED_DROPIN, LEGACY_RESOLVED_DROPIN, NM_DROPIN])
+
+    atomic_write(RESOLVED_DROPIN, (
+        "# Managed by DNSCrypt UI: send every query to dnscrypt-proxy.\n"
+        "[Resolve]\n"
+        f"DNS={dns}\n"
+        "Domains=~.\n"
+        "FallbackDNS=\n"
+        "DNSOverTLS=no\n"
+        "DNSStubListener=yes\n"
+    ))
+    # Keep per-network DNS servers (DHCP) out of systemd-resolved, otherwise
+    # it sends queries to them in parallel and they leak unencrypted.
+    atomic_write(NM_DROPIN, (
+        "# Managed by DNSCrypt UI: do not push DHCP DNS servers to systemd-resolved.\n"
+        "[main]\n"
+        "dns=none\n"
+    ))
+    # The drop-in from the old setup guide disabled the stub listener
+    if LEGACY_RESOLVED_DROPIN.exists():
+        LEGACY_RESOLVED_DROPIN.unlink()
+
+    changed_resolv = False
+    if not (RESOLV_CONF.is_symlink() and os.readlink(RESOLV_CONF) in (STUB_RESOLV, "/run/systemd/resolve/stub-resolv.conf")):
+        if RESOLV_CONF.exists() and not RESOLV_CONF.is_symlink():
+            shutil.copy2(RESOLV_CONF, backup_dir / "resolv.conf")
+        tmp = RESOLV_CONF.with_name(".resolv.conf.dnscrypt-ui")
+        if tmp.is_symlink() or tmp.exists():
+            tmp.unlink()
+        os.symlink(STUB_RESOLV, tmp)
+        os.replace(tmp, RESOLV_CONF)
+        restorecon(RESOLV_CONF)
+        changed_resolv = True
+
+    reload_network()
+    return {
+        "ok": True,
+        "message": "System DNS now goes through dnscrypt-proxy",
+        "backup": str(backup_dir),
+        "resolv_conf_replaced": changed_resolv,
+    }
+
+
+def cmd_undo_dns():
+    removed = []
+    for p in (RESOLVED_DROPIN, NM_DROPIN):
+        if p.exists():
+            backup([p])
+            p.unlink()
+            removed.append(str(p))
+    reload_network()
+    return {"ok": True, "message": "Restored the default network DNS setup", "removed": removed}
+
+
+def reload_network():
+    # Order matters: NetworkManager must stop (or start) pushing DNS before
+    # resolved restarts and asks NetworkManager for link DNS again.
+    if shutil.which("nmcli"):
+        run(["nmcli", "general", "reload", "conf"], timeout=30)
+        run(["nmcli", "general", "reload", "dns-full"], timeout=30)
+    run(["systemctl", "restart", "systemd-resolved"], timeout=30, check=True)
+    run(["resolvectl", "flush-caches"], timeout=10)
+
+
+def main(argv):
+    if os.geteuid() != 0:
+        raise HelperError("The helper must run as root (through pkexec)")
+    if len(argv) < 2:
+        raise HelperError("Missing command")
+    cmd = argv[1]
+    if cmd == "apply" and len(argv) == 2:
+        return cmd_apply()
+    if cmd == "setup-dns" and len(argv) == 3:
+        return cmd_setup_dns(argv[2])
+    if cmd == "undo-dns" and len(argv) == 2:
+        return cmd_undo_dns()
+    raise HelperError(f"Unknown command: {' '.join(argv[1:])}")
+
+
+if __name__ == "__main__":
+    os.umask(0o022)
+    try:
+        result = main(sys.argv)
+    except HelperError as e:
+        result = {"ok": False, "message": str(e), **e.extra}
+    except Exception as e:
+        result = {"ok": False, "message": f"Unexpected error: {e}"}
+    print(json.dumps(result))
+    sys.exit(0 if result.get("ok") else 1)
