@@ -294,7 +294,7 @@ def cmd_setup_dns(addr: str):
         restorecon(RESOLV_CONF)
         changed_resolv = True
 
-    reload_network()
+    reload_network(clear_link_dns=True)
     return {
         "ok": True,
         "message": "System DNS now goes through dnscrypt-proxy",
@@ -310,17 +310,27 @@ def cmd_undo_dns():
             backup([p])
             p.unlink()
             removed.append(str(p))
-    reload_network()
+    reload_network(clear_link_dns=False)
     return {"ok": True, "message": "Restored the default network DNS setup", "removed": removed}
 
 
-def reload_network():
-    # Order matters: NetworkManager must stop (or start) pushing DNS before
-    # resolved restarts and asks NetworkManager for link DNS again.
+def reload_network(clear_link_dns: bool):
+    """
+    systemd-resolved keeps per-link DNS servers across restarts (in
+    /run/systemd/resolve/netif/), so restarting it does not drop the servers
+    NetworkManager pushed earlier. When routing through dnscrypt-proxy, clear
+    them explicitly with `resolvectl revert`; when undoing, ask NetworkManager
+    to push them again.
+    """
     if shutil.which("nmcli"):
         run(["nmcli", "general", "reload", "conf"], timeout=30)
-        run(["nmcli", "general", "reload", "dns-full"], timeout=30)
     run(["systemctl", "restart", "systemd-resolved"], timeout=30, check=True)
+    if clear_link_dns:
+        for _index, name in socket.if_nameindex():
+            if name != "lo":
+                run(["resolvectl", "revert", name], timeout=10)
+    if shutil.which("nmcli"):
+        run(["nmcli", "general", "reload", "dns-full"], timeout=30)
     run(["resolvectl", "flush-caches"], timeout=10)
 
 

@@ -284,6 +284,20 @@ class HelperTests(unittest.TestCase):
         _, path = self.helper.validate_input({"toml": "server_names = []", "rules": ""})
         self.assertEqual(path, self.dir / "forwarding-rules.txt")
 
+    def test_reload_network_clears_link_dns_after_restart(self):
+        calls = []
+        self.helper.run = lambda argv, timeout=60, check=False: calls.append(argv)
+        self.helper.socket.if_nameindex = lambda: [(1, "lo"), (2, "enp4s0"), (3, "wlp5s0")]
+        self.helper.reload_network(clear_link_dns=True)
+        restart = calls.index(["systemctl", "restart", "systemd-resolved"])
+        reverts = [c for c in calls if c[:2] == ["resolvectl", "revert"]]
+        self.assertEqual(reverts, [["resolvectl", "revert", "enp4s0"], ["resolvectl", "revert", "wlp5s0"]])
+        self.assertTrue(all(calls.index(r) > restart for r in reverts))
+
+        calls.clear()
+        self.helper.reload_network(clear_link_dns=False)
+        self.assertFalse(any(c[:2] == ["resolvectl", "revert"] for c in calls))
+
     def test_parse_addr(self):
         self.assertEqual(str(self.helper.parse_addr("127.0.0.1")[0]), "127.0.0.1")
         self.assertEqual(self.helper.parse_addr("[::1]:5353")[1], 5353)
