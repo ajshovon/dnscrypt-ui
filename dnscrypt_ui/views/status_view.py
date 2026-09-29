@@ -3,8 +3,6 @@ Dashboard for DNSCrypt UI: service state, system DNS protection (leak check
 and one-click fix), a resolution test, and privacy requirements.
 """
 
-import os
-
 import gi
 
 gi.require_version("Gtk", "4.0")
@@ -14,8 +12,6 @@ from gi.repository import Adw, Gtk
 from ..backend import resolver_db
 from ..backend.service_manager import probe_target
 from ..util import run_in_thread
-
-RESOLVED_DROPIN = "/etc/systemd/resolved.conf.d/zz-dnscrypt-ui.conf"
 
 
 class StatusView(Adw.PreferencesPage):
@@ -96,16 +92,16 @@ class StatusView(Adw.PreferencesPage):
 
         # Requirements
         group = Adw.PreferencesGroup(
-            title="Resolver Requirements",
-            description="Selected resolvers that do not meet these are skipped by dnscrypt-proxy",
+            title="Automatic Mode Requirements",
+            description=(
+                "Only used when no resolvers are selected on the Resolvers page, to choose which "
+                "servers dnscrypt-proxy may pick by itself. Resolvers you select are always used."
+            ),
         )
         self.add(group)
-        self.dnssec_row = Adw.SwitchRow(title="Require DNSSEC", subtitle="Only use resolvers that validate DNSSEC")
-        self.nolog_row = Adw.SwitchRow(title="Require no-log", subtitle="Only use resolvers that promise not to log queries")
-        self.nofilter_row = Adw.SwitchRow(
-            title="Require no-filter",
-            subtitle="Only use resolvers that do not block anything. Turn off to use malware or ad blocking resolvers",
-        )
+        self.dnssec_row = Adw.SwitchRow(title="Require DNSSEC", subtitle="Only pick resolvers that validate DNSSEC")
+        self.nolog_row = Adw.SwitchRow(title="Require no-log", subtitle="Only pick resolvers that promise not to log queries")
+        self.nofilter_row = Adw.SwitchRow(title="Require no-filter", subtitle="Only pick resolvers that do not block anything")
         for row, attr in ((self.dnssec_row, "require_dnssec"), (self.nolog_row, "require_nolog"), (self.nofilter_row, "require_nofilter")):
             row.connect("notify::active", self._on_requirement_toggled, attr)
             group.add(row)
@@ -138,39 +134,51 @@ class StatusView(Adw.PreferencesPage):
             self.status_icon.set_from_icon_name("content-loading-symbolic")
         else:
             self.status_row.set_title("dnscrypt-proxy is stopped" if st.status_str != "failed" else "dnscrypt-proxy failed")
-            self.status_row.set_subtitle("Use the switch in the header bar to start it")
+            self.status_row.set_subtitle("Turn Encrypted DNS on with the switch in the header bar")
             self.status_icon.set_from_icon_name("dialog-error-symbolic" if st.status_str == "failed" else "media-playback-stop-symbolic")
-        self.btn_restart.set_sensitive(st.installed)
+        # Stopped on purpose: the header switch turns it back on (restoring routing)
+        self.btn_restart.set_sensitive(st.installed and st.status_str in ("active", "failed"))
 
         routing = self.win.routing
         for row in self._problem_rows:
             self.routing_row.remove(row)
         self._problem_rows = []
+        routing_state = self.win.service_mgr.routing_state()
+        self.undo_row.set_visible(routing_state in ("active", "parked"))
         if not routing.checked:
             return
-        if routing.protected and st.active:
+
+        self.routing_row.set_enable_expansion(False)
+        self.btn_fix.set_visible(False)
+        if not st.active and routing_state == "active":
+            self.routing_row.set_title("DNS is down")
+            self.routing_row.set_subtitle(
+                "System DNS goes to dnscrypt-proxy, but it is not running. "
+                "Turn Encrypted DNS on with the switch, or use Undo below."
+            )
+            self.routing_icon.set_from_icon_name("network-error-symbolic")
+        elif not st.active:
+            self.routing_row.set_title("Encrypted DNS is off")
+            self.routing_row.set_subtitle(
+                "Applications use your network's DNS servers, unencrypted. "
+                "Turn it on with the switch in the header bar."
+            )
+            self.routing_icon.set_from_icon_name("network-offline-symbolic")
+        elif routing.protected:
             self.routing_row.set_title("Protected")
             self.routing_row.set_subtitle("All DNS queries go through dnscrypt-proxy")
             self.routing_icon.set_from_icon_name("security-high-symbolic")
-            self.routing_row.set_enable_expansion(False)
-        elif routing.protected:
-            self.routing_row.set_title("Not resolving")
-            self.routing_row.set_subtitle("System DNS points at dnscrypt-proxy, but the service is not running")
-            self.routing_icon.set_from_icon_name("dialog-warning-symbolic")
-            self.routing_row.set_enable_expansion(False)
         else:
             self.routing_row.set_title("Not protected: DNS leaks")
             self.routing_row.set_subtitle(f"{len(routing.problems)} problem(s) found. Expand for details")
             self.routing_icon.set_from_icon_name("security-low-symbolic")
             self.routing_row.set_enable_expansion(True)
+            self.btn_fix.set_visible(True)
             for problem in routing.problems:
-                row = Adw.ActionRow(title=problem, title_lines=3)
+                row = Adw.ActionRow(title=problem, title_lines=3, use_markup=False)
                 row.set_title_selectable(True)
                 self.routing_row.add_row(row)
                 self._problem_rows.append(row)
-        self.btn_fix.set_visible(not routing.protected)
-
-        self.undo_row.set_visible(os.path.exists(RESOLVED_DROPIN))
 
     def update_summary(self):
         selected = self.cfg.server_names
@@ -178,7 +186,7 @@ class StatusView(Adw.PreferencesPage):
         self.resolvers_row.remove_css_class("warning")
         if not selected:
             self.lbl_resolvers.set_text("Automatic")
-            self.resolvers_row.set_subtitle("None selected: dnscrypt-proxy picks any server that meets the requirements")
+            self.resolvers_row.set_subtitle("None selected: dnscrypt-proxy picks servers that meet the automatic mode requirements")
         elif effective is None:
             self.lbl_resolvers.set_text(f"{len(selected)} selected")
             self.resolvers_row.set_subtitle("Resolver list is loading…")

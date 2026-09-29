@@ -5,6 +5,7 @@ preserving comments and every setting the UI does not manage.
 """
 
 import copy
+import hashlib
 import re
 import tomllib
 from dataclasses import dataclass
@@ -111,6 +112,7 @@ class ConfigManager:
         self.query_log_enabled = False
         self.query_log_file = DEFAULT_QUERY_LOG
         self.static_stamps: Dict[str, str] = {}
+        self.disabled_server_names: List[str] = []
 
         self.rules: List[ForwardingRule] = []
         self._rule_items: List[Union[str, ForwardingRule]] = []
@@ -130,16 +132,19 @@ class ConfigManager:
 
     def load(self):
         self.load_error = ""
+        toml_bytes = b""
         try:
-            self.raw_toml = self.toml_path.read_text(encoding="utf-8")
+            toml_bytes = self.toml_path.read_bytes()
+            self.raw_toml = toml_bytes.decode("utf-8")
             self.parsed_toml = tomllib.loads(self.raw_toml)
         except FileNotFoundError:
             self.raw_toml = ""
             self.parsed_toml = {}
             self.load_error = f"{self.toml_path} does not exist. Is dnscrypt-proxy installed?"
-        except (OSError, tomllib.TOMLDecodeError) as e:
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
             self.parsed_toml = {}
             self.load_error = f"Cannot read {self.toml_path}: {e}"
+        self._toml_sha256 = hashlib.sha256(toml_bytes).hexdigest()
 
         t = self.parsed_toml
         self.listen_addresses = list(t.get("listen_addresses", ["127.0.0.1:53"]))
@@ -156,6 +161,7 @@ class ConfigManager:
         self.require_nolog = bool(t.get("require_nolog", True))
         self.require_nofilter = bool(t.get("require_nofilter", True))
         self.forwarding_rules_file = str(t.get("forwarding_rules", "forwarding-rules.txt"))
+        self.disabled_server_names = list(t.get("disabled_server_names", []))
 
         qlog = t.get("query_log", {})
         qfile = qlog.get("file", "") if isinstance(qlog, dict) else ""
@@ -174,10 +180,13 @@ class ConfigManager:
         self._baseline = self.get_staged_files() if self.available else {}
 
     def _load_rules(self):
+        rules_bytes = b""
         try:
-            self.raw_rules = self.rules_path.read_text(encoding="utf-8")
-        except OSError:
+            rules_bytes = self.rules_path.read_bytes()
+            self.raw_rules = rules_bytes.decode("utf-8")
+        except (OSError, UnicodeDecodeError):
             self.raw_rules = ""
+        self._rules_sha256 = hashlib.sha256(rules_bytes).hexdigest()
         text = self.raw_rules if self.raw_rules.strip() else RULES_HEADER
         self._rule_items = parse_rules(text)
         self.rules = [i for i in self._rule_items if isinstance(i, ForwardingRule)]
@@ -278,4 +287,12 @@ class ConfigManager:
         return {
             "toml": self.generate_toml_content(),
             "rules": self.generate_rules_content(),
+        }
+
+    def apply_payload(self) -> Dict:
+        """What the helper's `apply` expects: new files plus hashes of the
+        files they were derived from, so edits made elsewhere are not lost."""
+        return {
+            **self.get_staged_files(),
+            "base": {"toml": self._toml_sha256, "rules": self._rules_sha256},
         }

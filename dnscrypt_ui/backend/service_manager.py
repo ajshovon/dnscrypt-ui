@@ -30,6 +30,10 @@ INSTALLED_HELPER = Path("/usr/local/libexec/dnscrypt-ui-helper")
 BUNDLED_HELPER = Path(__file__).resolve().parents[2] / "helper" / "dnscrypt-ui-helper"
 STUB_ADDRESSES = {"127.0.0.53", "127.0.0.54"}
 
+# Written by the helper; see helper/dnscrypt-ui-helper
+RESOLVED_DROPIN = Path("/etc/systemd/resolved.conf.d/zz-dnscrypt-ui.conf")
+PARKED_RESOLVED = Path("/etc/dnscrypt-proxy/.dnscrypt-ui-parked/resolved.conf")
+
 
 @dataclass
 class ServiceStatus:
@@ -145,46 +149,78 @@ class ServiceManager:
     # Privileged helper
 
     @staticmethod
-    def helper_installed() -> bool:
-        """True when the helper is installed root-owned and not writable by others."""
+    def helper_status() -> str:
+        """
+        "installed": root-owned copy matching this version of the app
+        "outdated": root-owned copy from an older version (run install.sh)
+        "missing": not installed; the copy in the source tree is used
+        """
         try:
             st = INSTALLED_HELPER.stat()
         except OSError:
-            return False
-        return st.st_uid == 0 and not st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            return "missing"
+        if st.st_uid != 0 or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            return "missing"
+        try:
+            same = INSTALLED_HELPER.read_bytes() == BUNDLED_HELPER.read_bytes()
+        except OSError:
+            same = True  # running without the source tree
+        return "installed" if same else "outdated"
 
-    def _helper_argv(self) -> List[str]:
-        if self.helper_installed():
-            return ["pkexec", str(INSTALLED_HELPER)]
-        # Development fallback: runs the helper from the source tree
-        return ["pkexec", "/usr/bin/python3", "-I", str(BUNDLED_HELPER)]
+    @classmethod
+    def helper_installed(cls) -> bool:
+        return cls.helper_status() == "installed"
 
     def run_helper(self, args: List[str], stdin: Optional[str] = None) -> Dict:
+        status = self.helper_status()
+        if status == "outdated":
+            return {
+                "ok": False,
+                "message": "The installed privileged helper is from an older version of DNSCrypt UI. "
+                           "Run ./install.sh in the dns-crypt-ui folder to update it.",
+            }
+        if status == "installed":
+            argv = ["pkexec", str(INSTALLED_HELPER)]
+        else:
+            # Development fallback: runs the helper from the source tree
+            argv = ["pkexec", "/usr/bin/python3", "-I", str(BUNDLED_HELPER)]
         try:
-            res = subprocess.run(
-                self._helper_argv() + args,
-                input=stdin,
-                capture_output=True,
-                text=True,
-                timeout=240,
-            )
+            res = subprocess.run(argv + args, input=stdin, capture_output=True, text=True, timeout=240)
         except (OSError, subprocess.TimeoutExpired) as e:
             return {"ok": False, "message": str(e)}
         if res.returncode in (126, 127) and not res.stdout.strip():
-            return {"ok": False, "message": "Authorization was cancelled or denied"}
+            return {"ok": False, "message": "Authorization was cancelled or denied", "cancelled": True}
         try:
             return json.loads(res.stdout.strip().splitlines()[-1])
         except (ValueError, IndexError):
             return {"ok": False, "message": (res.stderr or res.stdout or f"exit code {res.returncode}").strip()[-400:]}
 
-    def apply(self, staged: Dict[str, str]) -> Dict:
-        return self.run_helper(["apply"], stdin=json.dumps(staged))
+    def apply(self, payload: Dict) -> Dict:
+        return self.run_helper(["apply"], stdin=json.dumps(payload))
 
     def setup_system_dns(self, listen_address: str) -> Dict:
         return self.run_helper(["setup-dns", listen_address])
 
     def undo_system_dns(self) -> Dict:
         return self.run_helper(["undo-dns"])
+
+    def enable_encrypted_dns(self) -> Dict:
+        """Start dnscrypt-proxy and restore system DNS routing if it was parked."""
+        return self.run_helper(["enable"])
+
+    def disable_encrypted_dns(self) -> Dict:
+        """Give system DNS back to the network, then stop dnscrypt-proxy."""
+        return self.run_helper(["disable"])
+
+    @staticmethod
+    def routing_state() -> str:
+        """"active" (system DNS points at dnscrypt-proxy), "parked" (turned off
+        with the switch, restored when turned on) or "none"."""
+        if RESOLVED_DROPIN.exists():
+            return "active"
+        if PARKED_RESOLVED.exists():
+            return "parked"
+        return "none"
 
     # DNS routing
 

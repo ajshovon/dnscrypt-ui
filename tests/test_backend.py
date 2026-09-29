@@ -2,16 +2,25 @@
 Run with: python3 -m unittest discover -s tests -v   (from dns-crypt-ui/)
 """
 
+import hashlib
 import importlib.machinery
 import importlib.util
+import io
+import itertools
+import json
+import os
 import re
 import shutil
+import socket
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -207,6 +216,13 @@ class ValidateTests(unittest.TestCase):
                 validate.host_port(bad)
         self.assertEqual(validate.forward_target("$DHCP"), "$DHCP")
 
+    def test_loopback_listen(self):
+        self.assertEqual(validate.loopback_host_port("127.0.0.1"), "127.0.0.1:53")
+        self.assertEqual(validate.loopback_host_port("[::1]:5353"), "[::1]:5353")
+        for bad in ("0.0.0.0:53", "192.168.1.10:53", "[::]:53"):
+            with self.assertRaises(ValueError, msg=bad):
+                validate.loopback_host_port(bad)
+
     def test_private_targets(self):
         self.assertTrue(validate.is_private_target("192.168.1.1:53"))
         self.assertTrue(validate.is_private_target("$DHCP"))
@@ -237,42 +253,58 @@ class QueryLogTests(unittest.TestCase):
 
 
 class ResolverTests(unittest.TestCase):
-    ENTRY = {"name": "x", "proto": "DoH", "ipv6": False, "dnssec": True, "nolog": True, "nofilter": False}
+    GOOGLE = {"name": "google", "proto": "DoH", "ipv6": False, "dnssec": True, "nolog": False, "nofilter": True}
+    FILTERING = {"name": "cloudflare-security", "proto": "DoH", "ipv6": False, "dnssec": True, "nolog": True, "nofilter": False}
 
-    def test_exclusion(self):
+    def test_requirements_do_not_apply_to_named_servers(self):
+        # Verified against dnscrypt-proxy 2.1.14 with `-list`
         cfg = make_cfg()
-        self.assertIn("no-filter", resolver_db.exclusion_reason(self.ENTRY, cfg))
-        cfg.require_nofilter = False
-        self.assertIsNone(resolver_db.exclusion_reason(self.ENTRY, cfg))
-        cfg.doh_servers = False
-        self.assertIn("DoH", resolver_db.exclusion_reason(self.ENTRY, cfg))
+        cfg.require_nolog = cfg.require_nofilter = cfg.require_dnssec = True
+        self.assertIsNone(resolver_db.exclusion_reason(self.GOOGLE, cfg))
+        self.assertIsNone(resolver_db.exclusion_reason(dict(self.FILTERING, dnssec=False), cfg))
+
+    def test_named_servers_are_filtered_by_protocol_family_and_disabled_list(self):
+        cfg = make_cfg()
         self.assertIn("Not found", resolver_db.exclusion_reason(None, cfg))
-
-    def test_exclusion_fix(self):
-        cfg = make_cfg()
-        google = {"name": "google", "proto": "DoH", "ipv6": False, "dnssec": True, "nolog": False, "nofilter": True}
-        self.assertEqual(resolver_db.exclusion_fix(google, cfg)[:2], ("require_nolog", False))
-        cfg.require_nolog = False
-        self.assertIsNone(resolver_db.exclusion_fix(google, cfg))
-        self.assertIsNone(resolver_db.exclusion_reason(google, cfg))
         cfg.doh_servers = False
-        self.assertEqual(resolver_db.exclusion_fix(google, cfg)[:2], ("doh_servers", True))
+        self.assertIn("DoH", resolver_db.exclusion_reason(self.GOOGLE, cfg))
+        cfg.doh_servers = True
+        self.assertIn("IPv6", resolver_db.exclusion_reason(dict(self.GOOGLE, ipv6=True), cfg))
+        cfg.disabled_server_names = ["google"]
+        self.assertIn("disabled", resolver_db.exclusion_reason(self.GOOGLE, cfg))
+
+    def test_exclusion_fix_only_offers_protocol_switches(self):
+        cfg = make_cfg()
+        self.assertIsNone(resolver_db.exclusion_fix(self.GOOGLE, cfg))
+        cfg.doh_servers = False
+        self.assertEqual(resolver_db.exclusion_fix(self.GOOGLE, cfg)[:2], ("doh_servers", True))
         self.assertIsNone(resolver_db.exclusion_fix(None, cfg))
 
-    def test_allowing_loggers_writes_require_nolog_false(self):
+    def test_effective_servers(self):
         cfg = make_cfg()
-        cfg.require_nolog = False
-        cfg.toggle_resolver("google", True)
-        parsed = tomllib.loads(cfg.generate_toml_content())
-        self.assertIs(parsed["require_nolog"], False)
-        self.assertIn("google", parsed["server_names"])
-
-    def test_effective(self):
-        cfg = make_cfg()
-        catalog = [dict(self.ENTRY, name="cloudflare", nofilter=True)]
-        self.assertEqual(resolver_db.effective_servers(catalog, cfg), ["cloudflare"])
+        cfg.server_names = ["google", "missing-server"]
+        self.assertEqual(resolver_db.effective_servers([self.GOOGLE], cfg), ["google"])
         cfg.server_names = []
-        self.assertIsNone(resolver_db.effective_servers(catalog, cfg))
+        self.assertIsNone(resolver_db.effective_servers([self.GOOGLE], cfg))
+
+    def test_deprecated_servers_are_not_recommended(self):
+        entry = resolver_db._normalize({"name": "mullvad-doh", "proto": "DoH",
+                                        "description": "Mullvad resolver. - Deprecated, will be shot down"})
+        self.assertTrue(entry["deprecated"])
+        self.assertFalse(entry["recommended"])
+        self.assertTrue(resolver_db._normalize({"name": "google", "proto": "DoH"})["recommended"])
+
+
+class ApplyPayloadTests(unittest.TestCase):
+    def test_base_hashes_match_file_bytes(self):
+        cfg = make_cfg()
+        base = cfg.apply_payload()["base"]
+        self.assertEqual(base["toml"], hashlib.sha256(cfg.toml_path.read_bytes()).hexdigest())
+        self.assertEqual(base["rules"], hashlib.sha256(cfg.rules_path.read_bytes()).hexdigest())
+
+    def test_missing_rules_file_hashes_empty(self):
+        cfg = make_cfg(rules=None)
+        self.assertEqual(cfg.apply_payload()["base"]["rules"], hashlib.sha256(b"").hexdigest())
 
 
 def load_helper():
@@ -284,102 +316,288 @@ def load_helper():
     return module
 
 
+def sandbox_helper(test: unittest.TestCase, root: Path):
+    """A helper module whose every path points inside `root`, with root-only
+    and slow operations stubbed. Patches of shared modules are undone after the test."""
+    h = load_helper()
+    h.CONFIG_DIR = root / "etc-dnscrypt-proxy"
+    h.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    h.BACKUP_ROOT = h.CONFIG_DIR / ".dnscrypt-ui-backup"
+    h.CONFIG_BACKUPS = h.BACKUP_ROOT / "config"
+    h.NETWORK_BACKUPS = h.BACKUP_ROOT / "network"
+    h.PARK_DIR = h.CONFIG_DIR / ".dnscrypt-ui-parked"
+    h.LOG_DIR = root / "log"
+    h.CACHE_DIR = root / "cache"
+    h.RESOLVED_DROPIN = root / "resolved.conf.d" / "zz-dnscrypt-ui.conf"
+    h.LEGACY_RESOLVED_DROPIN = root / "resolved.conf.d" / "dnscrypt.conf"
+    h.NM_DROPIN = root / "nm.conf.d" / "90-dnscrypt-ui.conf"
+    h.SERVICE_DROPIN = root / "service.d" / "50-dnscrypt-ui.conf"
+    h.RESOLV_CONF = root / "resolv.conf"
+    h.ROUTING_FILES = {
+        "resolved.conf": h.RESOLVED_DROPIN,
+        "networkmanager.conf": h.NM_DROPIN,
+        "service.conf": h.SERVICE_DROPIN,
+    }
+    h.restorecon = lambda *a: None
+    test.enterContext(mock.patch.object(time, "sleep", lambda s: None))
+    test.enterContext(mock.patch.object(time, "monotonic", itertools.count().__next__))
+    test.enterContext(mock.patch.object(socket, "if_nameindex", lambda: [(1, "lo"), (2, "enp4s0")]))
+    return h
+
+
+LEAKING = "Global: 127.0.0.1\nLink 2 (enp4s0): 192.168.31.1\nLink 3 (wlp5s0):\n"
+CLEAN = "Global: 127.0.0.1\nLink 2 (enp4s0):\nLink 3 (wlp5s0):\n"
+
+
+@unittest.skipIf(os.geteuid() == 0, "helper tests must not run as root")
 class HelperTests(unittest.TestCase):
     def setUp(self):
-        self.helper = load_helper()
-        self.dir = Path(tempfile.mkdtemp())
-        self.helper.CONFIG_DIR = self.dir
+        self.helper = sandbox_helper(self, Path(tempfile.mkdtemp()))
+        self.calls = []
+        self.dns_outputs = []
+        self.state = "active"
+        self.helper.run = self.fake_run
+        self.helper.service_state = lambda: (self.state, "running")
+        self.helper.dns_probe = lambda addr, timeout: True
+
+    def fake_run(self, argv, timeout=60, check=False):
+        self.calls.append(argv)
+        out = self.dns_outputs.pop(0) if argv == ["resolvectl", "dns"] else ""
+        return subprocess.CompletedProcess(argv, 0, out, "")
+
+    # input validation
 
     def test_rejects_rules_outside_config_dir(self):
         for bad in ("/etc/shadow", "../x.txt", "sub/x.txt"):
             with self.assertRaises(self.helper.HelperError, msg=bad):
-                self.helper.validate_input({"toml": f"forwarding_rules = '{bad}'", "rules": ""})
+                self.helper.validate_input({"toml": f"forwarding_rules = '{bad}'", "rules": "", "base": {}})
 
-    def test_rejects_invalid_toml(self):
+    def test_rejects_invalid_toml_and_missing_base(self):
         with self.assertRaises(self.helper.HelperError):
-            self.helper.validate_input({"toml": "a = = 1", "rules": ""})
+            self.helper.validate_input({"toml": "a = = 1", "rules": "", "base": {}})
+        with self.assertRaises(self.helper.HelperError):
+            self.helper.validate_input({"toml": "", "rules": ""})
 
-    def test_accepts_default(self):
-        _, path = self.helper.validate_input({"toml": "server_names = []", "rules": ""})
-        self.assertEqual(path, self.dir / "forwarding-rules.txt")
+    def test_accepts_default_rules_path(self):
+        _, path = self.helper.validate_input({"toml": "server_names = []", "rules": "", "base": {}})
+        self.assertEqual(path, self.helper.CONFIG_DIR / "forwarding-rules.txt")
 
-    def _stub_network(self, dns_outputs):
-        calls = []
-        outputs = iter(dns_outputs)
+    # what apply may change
 
-        def fake_run(argv, timeout=60, check=False):
-            calls.append(argv)
-            out = next(outputs) if argv == ["resolvectl", "dns"] else ""
-            return subprocess.CompletedProcess(argv, 0, out, "")
+    OLD = {
+        "server_names": ["cloudflare"], "listen_addresses": ["127.0.0.1:53"], "require_nolog": True,
+        "fallback_resolvers": ["9.9.9.9:53"], "log_level": 2,
+        "sources": {"public-resolvers": {"cache_file": "/var/cache/dnscrypt-proxy/public-resolvers.md"}},
+        "query_log": {"format": "tsv"},
+    }
 
-        self.helper.run = fake_run
-        self.helper.time.sleep = lambda s: None
-        self.helper.socket.if_nameindex = lambda: [(1, "lo"), (2, "enp4s0"), (3, "wlp5s0")]
-        return calls
+    def change(self, **updates):
+        new = json.loads(json.dumps(self.OLD))
+        for dotted, value in updates.items():
+            *parents, last = dotted.split("__")
+            table = new
+            for part in parents:
+                table = table.setdefault(part, {})
+            if value is None:
+                table.pop(last, None)
+            else:
+                table[last] = value
+        self.helper.check_allowed_changes(self.OLD, new)
 
-    LEAKING = "Global: 127.0.0.1\nLink 2 (enp4s0): 192.168.31.1\nLink 3 (wlp5s0):\n"
-    CLEAN = "Global: 127.0.0.1\nLink 2 (enp4s0):\nLink 3 (wlp5s0):\n"
+    def test_allows_changes_the_app_makes(self):
+        log = str(self.helper.LOG_DIR / "query.log")
+        self.change(server_names=["google", "quad9-doh-ip4-port443-nofilter-pri"], require_nolog=False,
+                    listen_addresses=["127.0.0.1:5353", "[::1]:53"], bootstrap_resolvers=["9.9.9.11:53"],
+                    fallback_resolvers=None, query_log__file=log)
+        self.change(static__my_dns__stamp="sdns://AgcAAAAAAAAA")
+
+    def test_rejects_everything_else(self):
+        for updates in (
+            {"log_file": "/etc/cron.d/x"},
+            {"sources__public-resolvers__cache_file": "/etc/profile.d/x.sh"},
+            {"forwarding_rules": "/etc/shadow"},
+            {"log_level": 0},
+            {"listen_addresses": ["0.0.0.0:53"]},
+            {"listen_addresses": []},
+            {"query_log__file": "/etc/passwd"},
+            {"query_log__file": str(self.helper.LOG_DIR)},
+            {"static__x__stamp": "https://evil.example"},
+            {"require_nolog": "no"},
+            {"server_names": ["bad name"]},
+        ):
+            with self.assertRaises(self.helper.HelperError, msg=updates):
+                self.change(**updates)
+
+    def test_resolved_dns_value(self):
+        self.assertEqual(self.helper.resolved_dns_value("127.0.0.1:53"), "127.0.0.1")
+        self.assertEqual(self.helper.resolved_dns_value("127.0.0.1:5353"), "127.0.0.1:5353")
+        self.assertEqual(self.helper.resolved_dns_value("[::1]:5353"), "[::1]:5353")
+        with self.assertRaises(self.helper.HelperError):
+            self.helper.resolved_dns_value("192.168.1.10:53")
+
+    # network reload
 
     def test_link_dns_parser(self):
-        self._stub_network([self.LEAKING])
+        self.dns_outputs = [LEAKING]
         self.assertEqual(self.helper.link_dns(), {"enp4s0": ["192.168.31.1"]})
 
-    def test_setup_clears_link_dns_without_nm_restart_when_clean(self):
-        calls = self._stub_network([self.CLEAN])
+    def test_route_clears_link_dns_without_nm_restart_when_clean(self):
+        self.dns_outputs = [CLEAN]
         self.assertEqual(self.helper.reload_network(clear_link_dns=True), {})
-        restart = calls.index(["systemctl", "restart", "systemd-resolved"])
-        reverts = [i for i, c in enumerate(calls) if c[:2] == ["resolvectl", "revert"]]
-        self.assertEqual([calls[i][2] for i in reverts], ["enp4s0", "wlp5s0"])
+        restart = self.calls.index(["systemctl", "restart", "systemd-resolved"])
+        reverts = [i for i, c in enumerate(self.calls) if c[:2] == ["resolvectl", "revert"]]
+        self.assertEqual([self.calls[i][2] for i in reverts], ["enp4s0"])
         self.assertTrue(all(i > restart for i in reverts))
-        self.assertNotIn(["systemctl", "restart", "NetworkManager"], calls)
+        self.assertNotIn(["systemctl", "restart", "NetworkManager"], self.calls)
 
-    def test_setup_restarts_nm_when_dns_comes_back(self):
-        calls = self._stub_network([self.LEAKING, self.CLEAN])
+    def test_route_restarts_nm_when_dns_comes_back(self):
+        self.dns_outputs = [LEAKING, CLEAN]
         self.assertEqual(self.helper.reload_network(clear_link_dns=True), {})
-        nm = calls.index(["systemctl", "restart", "NetworkManager"])
-        self.assertTrue(any(c[:2] == ["resolvectl", "revert"] for c in calls[nm:]))
+        nm = self.calls.index(["systemctl", "restart", "NetworkManager"])
+        self.assertTrue(any(c[:2] == ["resolvectl", "revert"] for c in self.calls[nm:]))
 
-    def test_setup_reports_leftover(self):
-        self._stub_network([self.LEAKING, self.LEAKING])
+    def test_route_reports_leftover(self):
+        self.dns_outputs = [LEAKING, LEAKING]
         self.assertEqual(self.helper.reload_network(clear_link_dns=True), {"enp4s0": ["192.168.31.1"]})
 
-    def test_undo_restarts_nm_and_does_not_revert(self):
-        calls = self._stub_network([])
+    def test_unroute_restarts_nm_and_does_not_revert(self):
         self.helper.reload_network(clear_link_dns=False)
-        self.assertIn(["systemctl", "restart", "NetworkManager"], calls)
-        self.assertFalse(any(c[:2] == ["resolvectl", "revert"] for c in calls))
+        self.assertIn(["systemctl", "restart", "NetworkManager"], self.calls)
+        self.assertFalse(any(c[:2] == ["resolvectl", "revert"] for c in self.calls))
 
-    def test_nm_dropin_disables_resolved_push(self):
-        src = (ROOT / "helper" / "dnscrypt-ui-helper").read_text()
-        self.assertIn("systemd-resolved=false", src)
+    # setup / undo / disable / enable
 
-    def test_parse_addr(self):
-        self.assertEqual(str(self.helper.parse_addr("127.0.0.1")[0]), "127.0.0.1")
-        self.assertEqual(self.helper.parse_addr("[::1]:5353")[1], 5353)
+    def write_listen(self, addr="127.0.0.1:53"):
+        (self.helper.CONFIG_DIR / "dnscrypt-proxy.toml").write_text(f"listen_addresses = ['{addr}']\n")
+
+    def test_setup_writes_routing_and_quick_restart(self):
+        h = self.helper
+        os.symlink(h.STUB_RESOLV, h.RESOLV_CONF)
+        h.LEGACY_RESOLVED_DROPIN.parent.mkdir(parents=True)
+        h.LEGACY_RESOLVED_DROPIN.write_text("[Resolve]\nDNSStubListener=no\n")
+        h.PARK_DIR.mkdir(parents=True)
+        (h.PARK_DIR / "resolved.conf").write_text("stale")
+        self.dns_outputs = [CLEAN]
+        result = h.cmd_setup_dns("127.0.0.1:53")
+        self.assertTrue(result["ok"], result)
+        self.assertIn("DNS=127.0.0.1\n", h.RESOLVED_DROPIN.read_text())
+        self.assertIn("systemd-resolved=false", h.NM_DROPIN.read_text())
+        self.assertIn("RestartSec=2s", h.SERVICE_DROPIN.read_text())
+        self.assertFalse(h.LEGACY_RESOLVED_DROPIN.exists())
+        self.assertFalse(h.PARK_DIR.exists())
+        self.assertIn(["systemctl", "daemon-reload"], self.calls)
+
+    def test_setup_refuses_when_proxy_not_answering(self):
+        h = self.helper
+        h.dns_probe = lambda addr, timeout: False
+        with self.assertRaises(h.HelperError):
+            h.cmd_setup_dns("127.0.0.1:53")
+        self.assertFalse(h.RESOLVED_DROPIN.exists())
+
+    def test_disable_parks_routing_before_stopping(self):
+        h = self.helper
+        for p in h.ROUTING_FILES.values():
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(p.name)
+        result = h.cmd_disable()
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(sorted(result["parked"]), sorted(h.ROUTING_FILES))
+        self.assertFalse(any(p.exists() for p in h.ROUTING_FILES.values()))
+        for label, p in h.ROUTING_FILES.items():
+            self.assertEqual((h.PARK_DIR / label).read_text(), p.name)
+        nm = self.calls.index(["systemctl", "restart", "NetworkManager"])
+        stop = self.calls.index(["systemctl", "stop", "dnscrypt-proxy.service"])
+        self.assertLess(nm, stop, "network DNS must be back before the proxy stops")
+
+    def test_disable_without_routing_just_stops(self):
+        result = self.helper.cmd_disable()
+        self.assertEqual(result["parked"], [])
+        self.assertIn(["systemctl", "stop", "dnscrypt-proxy.service"], self.calls)
+        self.assertNotIn(["systemctl", "restart", "NetworkManager"], self.calls)
+
+    def test_enable_restores_parked_routing(self):
+        h = self.helper
+        self.write_listen()
+        for p in h.ROUTING_FILES.values():
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(p.name)
+        h.cmd_disable()
+        self.calls.clear()
+        self.dns_outputs = [CLEAN]
+        result = h.cmd_enable()
+        self.assertTrue(result["ok"] and result["routed"], result)
+        self.assertTrue(all(p.exists() for p in h.ROUTING_FILES.values()))
+        self.assertFalse(h.PARK_DIR.exists())
+        # the parked resolved drop-in is rewritten to match the listen address
+        self.assertIn("DNS=127.0.0.1\n", h.RESOLVED_DROPIN.read_text())
+
+    def test_enable_keeps_network_dns_if_proxy_not_answering(self):
+        h = self.helper
+        self.write_listen()
+        h.PARK_DIR.mkdir(parents=True)
+        (h.PARK_DIR / "resolved.conf").write_text("x")
+        h.dns_probe = lambda addr, timeout: False
+        with self.assertRaises(h.HelperError):
+            h.cmd_enable()
+        self.assertFalse(h.RESOLVED_DROPIN.exists())
+        self.assertTrue((h.PARK_DIR / "resolved.conf").exists())
+
+    def test_enable_without_parked_routing_only_starts(self):
+        self.write_listen()
+        result = self.helper.cmd_enable()
+        self.assertFalse(result["routed"])
+        self.assertIn(["systemctl", "start", "dnscrypt-proxy.service"], self.calls)
+        self.assertNotIn(["systemctl", "restart", "systemd-resolved"], self.calls)
+
+    def test_undo_removes_active_and_parked_routing(self):
+        h = self.helper
+        h.RESOLVED_DROPIN.parent.mkdir(parents=True)
+        h.RESOLVED_DROPIN.write_text("x")
+        h.PARK_DIR.mkdir(parents=True)
+        (h.PARK_DIR / "networkmanager.conf").write_text("x")
+        h.cmd_undo_dns()
+        self.assertFalse(h.RESOLVED_DROPIN.exists())
+        self.assertFalse(h.PARK_DIR.exists())
+
+    def test_sync_resolved_follows_listen_address(self):
+        h = self.helper
+        h.RESOLVED_DROPIN.parent.mkdir(parents=True)
+        h.RESOLVED_DROPIN.write_text(h.RESOLVED_TEMPLATE.format(dns="127.0.0.1"))
+        h.sync_resolved("127.0.0.1:5353")
+        self.assertIn("DNS=127.0.0.1:5353\n", h.RESOLVED_DROPIN.read_text())
+        self.assertIn(["systemctl", "restart", "systemd-resolved"], self.calls)
+        self.calls.clear()
+        h.sync_resolved("127.0.0.1:5353")
+        self.assertEqual(self.calls, [], "no restart when already in sync")
+
+    def test_backups_rotate_separately(self):
+        h = self.helper
+        f = h.CONFIG_DIR / "dnscrypt-proxy.toml"
+        f.write_text("x")
+        h.backup({"dnscrypt-proxy.toml": f}, h.CONFIG_BACKUPS)
+        for _ in range(h.KEEP_BACKUPS + 3):
+            h.backup(h.ROUTING_FILES, h.NETWORK_BACKUPS)
+        self.assertEqual(len(list(h.CONFIG_BACKUPS.iterdir())), 1)
+        self.assertEqual(len(list(h.NETWORK_BACKUPS.iterdir())), h.KEEP_BACKUPS)
 
 
+@unittest.skipIf(os.geteuid() == 0, "helper tests must not run as root")
 @unittest.skipUnless(Path("/usr/bin/dnscrypt-proxy").exists() and Path("/etc/dnscrypt-proxy").is_dir(),
                      "dnscrypt-proxy not installed")
 class HelperApplySandbox(unittest.TestCase):
     """Runs the helper's apply flow against a copy of the config, with systemd stubbed."""
 
     def setUp(self):
-        import io
-        self.io = io
-        self.helper = load_helper()
-        self.dir = Path(tempfile.mkdtemp()) / "conf"
-        shutil.copytree("/etc/dnscrypt-proxy", self.dir, ignore=shutil.ignore_patterns(".dnscrypt-ui-backup"))
-        h = self.helper
-        h.CONFIG_DIR = self.dir
-        h.BACKUP_DIR = self.dir / ".dnscrypt-ui-backup"
-        h.CACHE_DIR = self.dir / "cache"
-        h.LOG_DIR = self.dir / "log"
-        h.restorecon = lambda *a: None
+        root = Path(tempfile.mkdtemp())
+        h = self.helper = sandbox_helper(self, root)
+        shutil.rmtree(h.CONFIG_DIR)
+        shutil.copytree("/etc/dnscrypt-proxy", h.CONFIG_DIR,
+                        ignore=shutil.ignore_patterns(".dnscrypt-ui-backup", ".dnscrypt-ui-parked"))
         self.calls = []
         real_run = h.run
 
         def fake_run(argv, timeout=60, check=False):
-            if argv[0] in ("systemctl", "journalctl"):
+            if argv[0] in ("systemctl", "journalctl", "resolvectl"):
                 self.calls.append(argv)
                 return subprocess.CompletedProcess(argv, 0, "", "")
             return real_run(argv, timeout, check)
@@ -387,51 +605,92 @@ class HelperApplySandbox(unittest.TestCase):
         h.run = fake_run
         h.service_state = lambda: (self.state, "running")
         h.dns_probe = lambda addr, timeout: True
-        h.time.sleep = lambda s: None
         self.state = "active"
-        self.original = (self.dir / "dnscrypt-proxy.toml").read_text()
+        self.toml = h.CONFIG_DIR / "dnscrypt-proxy.toml"
+        self.original = self.toml.read_text()
+        self.cfg = ConfigManager(config_dir=h.CONFIG_DIR)
 
-    def apply(self, toml, rules="lan $DHCP\n"):
-        sys.stdin = self.io.StringIO(json_dumps({"toml": toml, "rules": rules}))
-        try:
+    def apply(self, payload):
+        with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload))):
             return self.helper.cmd_apply()
-        finally:
-            sys.stdin = sys.__stdin__
 
     def test_success_writes_and_backs_up(self):
-        new = self.original + "\n# changed\n"
-        # time.monotonic must advance for the stability window
-        clock = iter(range(0, 1000))
-        self.helper.time.monotonic = lambda: next(clock)
-        result = self.apply(new)
+        self.cfg.server_names = ["google"]
+        result = self.apply(self.cfg.apply_payload())
         self.assertTrue(result["ok"], result)
-        self.assertEqual((self.dir / "dnscrypt-proxy.toml").read_text(), new)
-        backups = list((self.dir / ".dnscrypt-ui-backup").iterdir())
+        self.assertEqual(tomllib.loads(self.toml.read_text())["server_names"], ["google"])
+        backups = list(self.helper.CONFIG_BACKUPS.iterdir())
         self.assertEqual((backups[0] / "dnscrypt-proxy.toml").read_text(), self.original)
         self.assertIn(["systemctl", "restart", "dnscrypt-proxy.service"], self.calls)
 
-    def test_check_failure_restores(self):
-        # Unknown keys only warn, so use a type error that -check rejects
-        bad = re.sub(r"(?m)^listen_addresses = .*$", "listen_addresses = 53", self.original)
+    def test_not_restarted_when_encrypted_dns_is_off(self):
+        self.state = "inactive"
+        self.cfg.server_names = ["google"]
+        self.assertTrue(self.apply(self.cfg.apply_payload())["ok"])
+        self.assertNotIn(["systemctl", "restart", "dnscrypt-proxy.service"], self.calls)
+
+    def test_conflict_when_file_changed_on_disk(self):
+        self.cfg.server_names = ["google"]
+        payload = self.cfg.apply_payload()
+        self.toml.write_text(self.original + "\n# edited by hand\n")
         with self.assertRaises(self.helper.HelperError) as ctx:
-            self.apply(bad)
+            self.apply(payload)
+        self.assertEqual(ctx.exception.extra["stage"], "conflict")
+        self.assertIn("# edited by hand", self.toml.read_text())
+
+    def test_rejects_unmanaged_change(self):
+        payload = self.cfg.apply_payload()
+        payload["toml"] = "log_file = '/etc/cron.d/owned'\n" + payload["toml"]
+        with self.assertRaises(self.helper.HelperError):
+            self.apply(payload)
+        self.assertEqual(self.toml.read_text(), self.original)
+        self.assertFalse(self.helper.CONFIG_BACKUPS.exists())
+
+    def test_check_failure_restores(self):
+        # Allowed by the helper, but `dnscrypt-proxy -check` fails: "None of the
+        # servers listed in the server_names list were found"
+        self.cfg.server_names = ["does-not-exist"]
+        with self.assertRaises(self.helper.HelperError) as ctx:
+            self.apply(self.cfg.apply_payload())
         self.assertEqual(ctx.exception.extra["stage"], "check")
-        self.assertEqual((self.dir / "dnscrypt-proxy.toml").read_text(), self.original)
+        self.assertIn("server_names", ctx.exception.extra["output"])
+        self.assertEqual(self.toml.read_text(), self.original)
         self.assertFalse(any(c[:2] == ["systemctl", "restart"] for c in self.calls))
 
     def test_restart_failure_restores(self):
         self.state = "failed"
-        clock = iter(range(0, 1000))
-        self.helper.time.monotonic = lambda: next(clock)
+        self.cfg.server_names = ["google"]
+        payload = self.cfg.apply_payload()
+        # service is "failed" before apply, so apply must not try to restart it
+        self.assertTrue(self.apply(payload)["ok"])
+        self.state = "active"
+        states = iter(["active"] + ["failed"] * 1000)
+        self.helper.service_state = lambda: (next(states), "")
+        self.cfg.load()
+        self.cfg.server_names = ["cloudflare"]
         with self.assertRaises(self.helper.HelperError) as ctx:
-            self.apply(self.original + "\n# changed\n")
+            self.apply(self.cfg.apply_payload())
         self.assertEqual(ctx.exception.extra["stage"], "restart")
-        self.assertEqual((self.dir / "dnscrypt-proxy.toml").read_text(), self.original)
+        self.assertEqual(tomllib.loads(self.toml.read_text())["server_names"], ["google"])
 
+    def test_query_log_is_private(self):
+        self.cfg.query_log_enabled = True
+        self.cfg.query_log_file = str(self.helper.LOG_DIR / "query.log")
+        chowns = []
+        with mock.patch.object(os, "chown", lambda p, u, g: chowns.append((str(p), u, g))), \
+             mock.patch.dict(os.environ, {"PKEXEC_UID": str(os.getuid())}):
+            self.assertTrue(self.apply(self.cfg.apply_payload())["ok"])
+        log = self.helper.LOG_DIR / "query.log"
+        self.assertEqual(stat.S_IMODE(log.stat().st_mode), 0o640)
+        self.assertEqual(chowns, [(str(log), 0, os.getgid())])
 
-def json_dumps(obj):
-    import json
-    return json.dumps(obj)
+    def test_listen_change_updates_system_dns(self):
+        h = self.helper
+        h.RESOLVED_DROPIN.parent.mkdir(parents=True)
+        h.RESOLVED_DROPIN.write_text(h.RESOLVED_TEMPLATE.format(dns="127.0.0.1"))
+        self.cfg.listen_addresses = ["127.0.0.1:5353"]
+        self.assertTrue(self.apply(self.cfg.apply_payload())["ok"])
+        self.assertIn("DNS=127.0.0.1:5353\n", h.RESOLVED_DROPIN.read_text())
 
 
 @unittest.skipUnless(Path("/usr/bin/dnscrypt-proxy").exists() and Path("/etc/dnscrypt-proxy").is_dir(),

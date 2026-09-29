@@ -51,6 +51,15 @@ def host_port(value: str, default_port: int = 53) -> str:
     return f"[{ip}]:{port}" if ip.version == 6 else f"{ip}:{port}"
 
 
+def loopback_host_port(value: str) -> str:
+    """Listen address for dnscrypt-proxy: loopback only, so it never serves the LAN."""
+    normalized = host_port(value)
+    host = normalized.rsplit(":", 1)[0].strip("[]")
+    if not ipaddress.ip_address(host).is_loopback:
+        raise ValueError(f"'{value}' is not a loopback address. Use 127.0.0.1:53 or [::1]:53")
+    return normalized
+
+
 def forward_target(value: str) -> str:
     v = value.strip()
     if v in ("$DHCP", "$BOOTSTRAP"):

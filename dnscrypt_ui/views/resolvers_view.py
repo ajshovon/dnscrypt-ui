@@ -57,6 +57,7 @@ class ResolversView(Adw.PreferencesPage):
         row2 = Gtk.Box(spacing=12)
         scope_box = Gtk.Box(css_classes=["linked"])
         first = None
+        self._scope_buttons = {}
         for label, code in SCOPES:
             btn = Gtk.ToggleButton(label=label, active=code == self._scope)
             if first:
@@ -64,6 +65,8 @@ class ResolversView(Adw.PreferencesPage):
             first = first or btn
             btn.connect("toggled", self._on_scope_toggled, code)
             scope_box.append(btn)
+            self._scope_buttons[code] = btn
+        self._scope_before_search = None
         row2.append(scope_box)
 
         proto = Gtk.DropDown.new_from_strings(["Any protocol", "DoH", "DNSCrypt"])
@@ -87,14 +90,23 @@ class ResolversView(Adw.PreferencesPage):
 
     def _on_search_changed(self, entry):
         self._query = entry.get_text().strip().lower()
+        # Searching only the recommended few is rarely what people want:
+        # switch to All while searching, and back when the search is cleared.
         if self._query and self._scope == "recommended":
-            self._scope = "all_search"
-        elif not self._query and self._scope == "all_search":
-            self._scope = "recommended"
+            self._scope_before_search = "recommended"
+            self._scope_buttons["all"].set_active(True)  # reloads
+            return
+        if not self._query and self._scope_before_search:
+            restore, self._scope_before_search = self._scope_before_search, None
+            if self._scope == "all":
+                self._scope_buttons[restore].set_active(True)  # reloads
+                return
         self.reload()
 
     def _on_scope_toggled(self, btn, code):
         if btn.get_active():
+            if self._scope_before_search and code != "all":
+                self._scope_before_search = None  # the user picked a scope themselves
             self._scope = code
             self.reload()
 
@@ -216,6 +228,8 @@ class ResolversView(Adw.PreferencesPage):
         badges.append(_badge(entry["proto"], kind))
         if entry.get("dnssec"):
             badges.append(_badge("DNSSEC", "security"))
+        if entry.get("deprecated"):
+            badges.append(_badge("Deprecated", "blocked"))
         if entry.get("nolog"):
             badges.append(_badge("No-log", "privacy"))
         elif not entry.get("missing") and not entry.get("static"):
@@ -228,10 +242,7 @@ class ResolversView(Adw.PreferencesPage):
         if fix and selected:
             attr, value, label = fix
             btn = Gtk.Button(label=label, valign=Gtk.Align.CENTER, margin_end=6)
-            btn.set_tooltip_text(
-                "Change this requirement for all resolvers. Only the resolvers you select are used, "
-                "so this does not add other servers unless none are selected."
-            )
+            btn.set_tooltip_text("Turn this protocol back on in Settings")
             btn.connect("clicked", lambda _b: self._apply_fix(attr, value))
             row.add_suffix(btn)
 
@@ -246,7 +257,7 @@ class ResolversView(Adw.PreferencesPage):
         self.win.status_view.reload()
         self.win.settings_view.reload()
         self.win.config_changed()
-        self.win.show_toast("Requirement changed. Press Apply to use it")
+        self.win.show_toast("Setting changed. Press Apply to use it")
 
     def _on_switch_toggled(self, switch, _pspec, name: str):
         self.cfg.toggle_resolver(name, switch.get_active())

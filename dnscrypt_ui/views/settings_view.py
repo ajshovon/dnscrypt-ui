@@ -27,8 +27,11 @@ class SettingsView(Adw.PreferencesPage):
         # Network
         net = Adw.PreferencesGroup(title="Network")
         self.add(net)
-        self.listen_row = Adw.EntryRow(title="Listen addresses (comma separated)")
-        self.listen_row.connect("changed", self._on_list_changed, "listen_addresses", validate.host_port)
+        self.listen_row = Adw.EntryRow(title="Listen addresses (comma separated, loopback only)")
+        self.listen_row.connect("changed", self._on_list_changed, "listen_addresses", validate.loopback_host_port)
+        self.listen_row.set_tooltip_text(
+            "Where dnscrypt-proxy accepts queries. System DNS is updated to follow the first address when you apply."
+        )
         net.add(self.listen_row)
 
         self.bootstrap_row = Adw.EntryRow(title="Bootstrap resolvers (comma separated)")
@@ -71,9 +74,13 @@ class SettingsView(Adw.PreferencesPage):
         inst = Adw.PreferencesGroup(title="Installation")
         self.add(inst)
         helper_row = Adw.ActionRow(title="Privileged helper")
-        if self.service_mgr.helper_installed():
+        helper_status = self.service_mgr.helper_status()
+        if helper_status == "installed":
             helper_row.set_subtitle("Installed with its own polkit action")
             helper_row.add_prefix(Gtk.Image.new_from_icon_name("object-select-symbolic"))
+        elif helper_status == "outdated":
+            helper_row.set_subtitle("Out of date: run ./install.sh in the dns-crypt-ui folder to update it")
+            helper_row.add_prefix(Gtk.Image.new_from_icon_name("dialog-warning-symbolic"))
         else:
             helper_row.set_subtitle(
                 "Not installed: changes run the helper from the source folder. "

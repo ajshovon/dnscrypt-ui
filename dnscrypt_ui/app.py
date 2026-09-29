@@ -112,7 +112,9 @@ class MainWindow(Adw.ApplicationWindow):
         header_bar.pack_end(menu_btn)
 
         self.quick_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
-        self.quick_switch.set_tooltip_text("Start or stop dnscrypt-proxy")
+        self.quick_switch.set_tooltip_text(
+            "Encrypted DNS. Off stops dnscrypt-proxy and gives system DNS back to your network"
+        )
         self.quick_switch.connect("state-set", self._on_quick_switch_state_set)
         header_bar.pack_start(self.quick_switch)
 
@@ -211,16 +213,16 @@ class MainWindow(Adw.ApplicationWindow):
         if effective is not None and not effective:
             self.show_message(
                 "No usable resolvers",
-                "None of the selected resolvers can be used with the current requirements "
-                "(DNSSEC, no-log, no-filter, protocols). dnscrypt-proxy would fail to resolve anything.\n\n"
-                "Select another resolver or relax the requirements on the Dashboard.",
+                "None of the selected resolvers can be used: they are missing from the resolver list, "
+                "disabled, or use a protocol that is turned off in Settings. dnscrypt-proxy would fail "
+                "to resolve anything.\n\nSelect another resolver on the Resolvers page.",
             )
             return
 
         self.btn_apply.set_sensitive(False)
         self.btn_apply.set_label("Applying…")
-        staged = self.config_mgr.get_staged_files()
-        run_in_thread(lambda: self.service_mgr.apply(staged), self._finish_apply)
+        payload = self.config_mgr.apply_payload()
+        run_in_thread(lambda: self.service_mgr.apply(payload), self._finish_apply)
 
     def _finish_apply(self, result: dict):
         self.btn_apply.set_sensitive(True)
@@ -228,17 +230,26 @@ class MainWindow(Adw.ApplicationWindow):
         if result.get("ok"):
             self.config_mgr.load()
             self.reload_views()
-            msg = "Configuration applied and dnscrypt-proxy restarted"
-            if not result.get("answering", True):
+            msg = result.get("message", "Configuration applied")
+            if result.get("answering") is False:
                 msg = "Applied, but dnscrypt-proxy is not answering queries yet"
             self.show_toast(msg)
-            self.refresh_status()
-        else:
+        elif result.get("stage") == "conflict":
+            dialog = Adw.AlertDialog(
+                heading="Configuration changed elsewhere",
+                body=result.get("message", ""),
+            )
+            dialog.add_response("cancel", "Keep My Changes")
+            dialog.add_response("reload", "Reload")
+            dialog.set_response_appearance("reload", Adw.ResponseAppearance.DESTRUCTIVE)
+            dialog.connect("response", lambda _d, r: r == "reload" and self.discard_changes())
+            dialog.present(self)
+        elif not result.get("cancelled"):
             body = result.get("message", "Unknown error")
             if result.get("output"):
                 body += "\n\n" + result["output"]
             self.show_message("Could not apply configuration", body)
-            self.refresh_status()
+        self.refresh_status()
 
     # Service toggle
 
@@ -248,17 +259,19 @@ class MainWindow(Adw.ApplicationWindow):
         if state == self.service_status.active:
             return False
         switch.set_sensitive(False)
-        action = self.service_mgr.start if state else self.service_mgr.stop
-        run_in_thread(action, lambda r: self._finish_toggle(r, state))
+        action = self.service_mgr.enable_encrypted_dns if state else self.service_mgr.disable_encrypted_dns
+        run_in_thread(action, self._finish_toggle)
         return True  # keep the old state until the service confirms
 
-    def _finish_toggle(self, result, requested: bool):
-        ok, err = result
+    def _finish_toggle(self, result: dict):
         self.quick_switch.set_sensitive(True)
-        if ok:
-            self.show_toast("dnscrypt-proxy started" if requested else "dnscrypt-proxy stopped")
-        elif err:
-            self.show_toast(err)
+        if result.get("ok"):
+            self.show_toast(result.get("message", "Done"))
+        elif not result.get("cancelled"):
+            body = result.get("message", "Unknown error")
+            if result.get("output"):
+                body += "\n\n" + result["output"]
+            self.show_message("Could not change encrypted DNS", body)
         self.refresh_status()
         self._sync_quick_switch()
 
@@ -334,7 +347,7 @@ class DNSCryptUIApp(Adw.Application):
             "A GNOME interface for dnscrypt-proxy with split-DNS domain rules, "
             "encrypted upstream resolvers, leak detection, and live query inspection."
         )
-        about.set_website("https://github.com/DNSCrypt/dnscrypt-proxy")
+        about.add_link("dnscrypt-proxy", "https://github.com/DNSCrypt/dnscrypt-proxy")
         about.set_license_type(Gtk.License.GPL_3_0)
         about.present(self.window)
 

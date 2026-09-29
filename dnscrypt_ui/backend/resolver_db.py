@@ -32,16 +32,20 @@ RECOMMENDED = {
 
 
 def _normalize(entry: Dict) -> Dict:
+    name = entry.get("name", "")
+    description = (entry.get("description") or "").split("\n")[0]
+    deprecated = "deprecated" in description.lower()
     return {
-        "name": entry.get("name", ""),
+        "name": name,
         "proto": entry.get("proto", "?"),
         "ipv6": bool(entry.get("ipv6", False)),
         "dnssec": bool(entry.get("dnssec", False)),
         "nolog": bool(entry.get("nolog", False)),
         "nofilter": bool(entry.get("nofilter", False)),
-        "description": (entry.get("description") or "").split("\n")[0],
-        "label": RECOMMENDED.get(entry.get("name", ""), entry.get("name", "")),
-        "recommended": entry.get("name") in RECOMMENDED,
+        "description": description,
+        "deprecated": deprecated,
+        "label": RECOMMENDED.get(name, name),
+        "recommended": name in RECOMMENDED and not deprecated,
     }
 
 
@@ -90,13 +94,21 @@ def find_resolver(catalog: List[Dict], name: str) -> Optional[Dict]:
     return None
 
 
+# dnscrypt-proxy filters servers named in server_names only by existence,
+# disabled_server_names, protocol and IP family. require_dnssec, require_nolog
+# and require_nofilter only apply in automatic mode (empty server_names).
+# Verified with `dnscrypt-proxy -list` (2.1.14).
+
+
 def exclusion_reason(entry: Optional[Dict], cfg) -> Optional[str]:
     """
-    Why dnscrypt-proxy would skip this server with the current settings,
-    or None if it is usable. `cfg` is a ConfigManager.
+    Why dnscrypt-proxy would not use this server if it is listed in
+    server_names, or None if it would. `cfg` is a ConfigManager.
     """
     if entry is None:
         return "Not found in the resolver sources"
+    if entry["name"] in cfg.disabled_server_names:
+        return "Listed in disabled_server_names"
     proto = entry["proto"]
     if proto == "DoH" and not cfg.doh_servers:
         return "DoH servers are disabled in Settings"
@@ -106,20 +118,13 @@ def exclusion_reason(entry: Optional[Dict], cfg) -> Optional[str]:
         return "ODoH servers are disabled"
     if entry["ipv6"] and not cfg.ipv6_servers:
         return "IPv6 servers are disabled"
-    if cfg.require_dnssec and not entry["dnssec"]:
-        return "Does not validate DNSSEC (required)"
-    if cfg.require_nolog and not entry["nolog"]:
-        return "May log queries (no-log is required)"
-    if cfg.require_nofilter and not entry["nofilter"]:
-        return "Filters results (no-filter is required)"
     return None
 
 
 def exclusion_fix(entry: Optional[Dict], cfg) -> Optional[tuple]:
     """
-    The setting change that would stop dnscrypt-proxy skipping this server:
-    (config attribute, new value, button label), or None if it is usable or
-    cannot be fixed by a setting. Mirrors the order of exclusion_reason().
+    The setting change that would make dnscrypt-proxy use this selected
+    server: (config attribute, new value, button label), or None.
     """
     if entry is None:
         return None
@@ -128,16 +133,6 @@ def exclusion_fix(entry: Optional[Dict], cfg) -> Optional[tuple]:
         return ("doh_servers", True, "Enable DoH")
     if proto == "DNSCrypt" and not cfg.dnscrypt_servers:
         return ("dnscrypt_servers", True, "Enable DNSCrypt")
-    if proto == "ODoH" and not cfg.odoh_servers:
-        return None
-    if entry["ipv6"] and not cfg.ipv6_servers:
-        return None
-    if cfg.require_dnssec and not entry["dnssec"]:
-        return ("require_dnssec", False, "Allow without DNSSEC")
-    if cfg.require_nolog and not entry["nolog"]:
-        return ("require_nolog", False, "Allow logging")
-    if cfg.require_nofilter and not entry["nofilter"]:
-        return ("require_nofilter", False, "Allow filtering")
     return None
 
 

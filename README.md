@@ -3,7 +3,8 @@
 A GNOME / Libadwaita interface for **`dnscrypt-proxy`** on Fedora and other Linux distributions.
 
 - **System DNS protection**: checks that every application actually resolves through dnscrypt-proxy (no leaks to DHCP/router DNS), and fixes it in one click.
-- **Resolvers**: pick encrypted DoH / DNSCrypt upstreams from the list dnscrypt-proxy itself loads, see why a server would be skipped (no-log, no-filter, DNSSEC, protocol), or add your own `sdns://` stamp.
+- **Encrypted DNS switch**: turning it off gives system DNS back to your network and then stops dnscrypt-proxy, so you are never left without DNS. Turning it on reverses that.
+- **Resolvers**: pick encrypted DoH / DNSCrypt upstreams from the list dnscrypt-proxy itself loads, see why a server would be skipped (missing, disabled, or protocol turned off), or add your own `sdns://` stamp.
 - **Domain Rules (split DNS)**: send a domain and its subdomains to a specific DNS server, e.g. `lan → $DHCP` or `corp.example → 10.0.0.53`.
 - **Query Log**: live view of dnscrypt-proxy's query log with blocked/error highlighting.
 - **Safe apply**: changes are validated with `dnscrypt-proxy -check`, backed up, and rolled back automatically if the service does not come up.
@@ -39,7 +40,15 @@ dns=none
 
 It also makes `/etc/resolv.conf` a link to the systemd-resolved stub, then reloads NetworkManager and restarts systemd-resolved. Without the NetworkManager part, systemd-resolved keeps sending queries to the DHCP server in parallel, and they leak unencrypted.
 
-**Undo** on the Dashboard removes both files.
+It also installs a drop-in that restarts a crashed dnscrypt-proxy after 2 seconds instead of Fedora's 2 minutes, because nothing resolves while it is down.
+
+**Undo** on the Dashboard removes these files. The **Encrypted DNS** switch in the header bar (and in the indicator) only *parks* them: off moves them to `/etc/dnscrypt-proxy/.dnscrypt-ui-parked/` and gives DNS back to your network, on starts dnscrypt-proxy, waits until it answers, and moves them back.
+
+What you give up while routing is on: DNS servers pushed by VPN connections are not used (add Domain Rules for internal VPN domains), names only your router knows (e.g. `router.lan`) need a rule such as `lan → $DHCP`, and captive portals on public Wi-Fi need `[captive_portals]` enabled in `dnscrypt-proxy.toml`.
+
+## Resolver requirements
+
+`require_dnssec`, `require_nolog` and `require_nofilter` only apply in **automatic mode**, when no resolvers are selected. dnscrypt-proxy always uses resolvers you select by name, whatever these say. It only skips a named resolver if it is missing from the resolver list, listed in `disabled_server_names`, uses a protocol turned off in Settings, or is IPv6-only while IPv6 servers are off.
 
 > Older versions of this README said to set `DNSStubListener=no`. That left the router's DNS in `/etc/resolv.conf` and leaked queries. **Fix** removes that old `dnscrypt.conf` drop-in.
 
@@ -47,9 +56,13 @@ It also makes `/etc/resolv.conf` a link to the systemd-resolved stub, then reloa
 
 The app never runs code as root from your home directory or `/tmp` once the helper is installed:
 
-1. The new `dnscrypt-proxy.toml` and `forwarding-rules.txt` are sent to `/usr/local/libexec/dnscrypt-ui-helper` over stdin, through `pkexec` (polkit action `io.github.shovon.DNSCryptUI.helper`).
-2. The helper only writes files directly inside `/etc/dnscrypt-proxy`, keeps the last 10 versions in `/etc/dnscrypt-proxy/.dnscrypt-ui-backup/`, and runs `dnscrypt-proxy -check`.
-3. It restarts the service and restores the previous files if it does not stay up.
+1. The new `dnscrypt-proxy.toml` and `forwarding-rules.txt` are sent to `/usr/local/libexec/dnscrypt-ui-helper` over stdin, through `pkexec` (polkit action `io.github.shovon.DNSCryptUI.helper`), together with SHA-256 hashes of the files the app loaded.
+2. The helper refuses if the files changed on disk since then (the app offers to reload), and refuses any change to a setting the app does not manage. It only accepts resolvers, protocol switches, requirements, loopback listen addresses, bootstrap resolvers, static stamps, and a query log inside `/var/log/dnscrypt-proxy`. dnscrypt-proxy runs as root, and many of its options are file paths, so this keeps the helper from being usable to write arbitrary files as root.
+3. It keeps the last 10 versions in `/etc/dnscrypt-proxy/.dnscrypt-ui-backup/config/` (network changes rotate separately in `network/`), runs `dnscrypt-proxy -check`, restarts the service, and restores the previous files if it does not stay up. If the listen address changed, it updates systemd-resolved to match.
+
+The query log records every domain this computer looks up, so the helper makes it readable only by root and your user's group (mode 0640).
+
+After updating DNSCrypt UI, run `./install.sh` again: the app refuses to use an installed helper that does not match its own version.
 
 Starting and stopping the service uses systemd's D-Bus API and its own polkit prompt.
 
