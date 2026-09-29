@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=DNSCrypt UI
+Comment=Manage dnscrypt-proxy, YogaDNS-style split DNS domain rules, and DoH resolvers
+Exec=dnscrypt-ui
+Icon=io.github.shovon.DNSCryptUI
+Terminal=false
+Type=Application
+Categories=GNOME;GTK;Network;Security;Settings;
+Keywords=dns;dnscrypt;doh;split-dns;yogadns;adwaita;privacy;
+StartupNotify=true
+X-Purism-FormFactor=Workstation;Mobile;

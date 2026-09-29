@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="shieldGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#3584e4" />
+      <stop offset="100%" stop-color="#1c71d8" />
+    </linearGradient>
+    <linearGradient id="accentGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#2ec27e" />
+      <stop offset="100%" stop-color="#26a269" />
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="4" stdDeviation="4" flood-opacity="0.25" />
+    </filter>
+  </defs>
+
+  <!-- Background Base / Shield -->
+  <path d="M 64,12 C 90,12 110,24 110,48 C 110,84 64,116 64,116 C 64,116 18,84 18,48 C 18,24 38,12 64,12 Z"
+        fill="url(#shieldGrad)" filter="url(#shadow)" />
+
+  <!-- Shield Border Highlight -->
+  <path d="M 64,16 C 88,16 106,27 106,50 C 106,82 64,111 64,111 C 64,111 22,82 22,50 C 22,27 40,16 64,16 Z"
+        fill="none" stroke="#62a0ea" stroke-width="2" opacity="0.6" />
+
+  <!-- DNS Nodes & Connections -->
+  <!-- Top Node -->
+  <circle cx="64" cy="40" r="7" fill="#ffffff" />
+
+  <!-- Connection Lines -->
+  <line x1="64" y1="40" x2="42" y2="70" stroke="#ffffff" stroke-width="3.5" stroke-linecap="round" />
+  <line x1="64" y1="40" x2="86" y2="70" stroke="#ffffff" stroke-width="3.5" stroke-linecap="round" />
+  <line x1="42" y1="70" x2="86" y2="70" stroke="#ffffff" stroke-width="3" stroke-linecap="round" opacity="0.6" />
+
+  <!-- Left & Right Nodes -->
+  <circle cx="42" cy="70" r="6" fill="#ffffff" />
+  <circle cx="86" cy="70" r="6" fill="#ffffff" />
+
+  <!-- Center Security Lock / Key Badge -->
+  <circle cx="64" cy="78" r="14" fill="url(#accentGrad)" filter="url(#shadow)" />
+  <path d="M 60,76 L 60,73 C 60,70.8 61.8,69 64,69 C 66.2,69 68,70.8 68,73 L 68,76 M 58,76 L 70,76 C 71.1,76 72,76.9 72,78 L 72,83 C 72,84.1 71.1,85 70,85 L 58,85 C 56.9,85 56,84.1 56,83 L 56,78 C 56,76.9 56.9,76 58,76 Z"
+        fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+</svg>
