@@ -269,7 +269,7 @@ class StatusView(Adw.PreferencesPage):
                     self.win.show_message("Could not change system DNS", result.get("message", "Unknown error"))
                 self.win.refresh_status()
 
-                run_in_thread(lambda: self.win.service_mgr.setup_system_dns(addr), done)
+            run_in_thread(lambda: self.win.service_mgr.setup_system_dns(addr), done)
 
         dialog.connect("response", on_response)
         dialog.present(self.win)
