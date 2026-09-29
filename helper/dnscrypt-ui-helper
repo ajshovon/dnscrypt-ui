@@ -19,6 +19,7 @@ import ipaddress
 import json
 import os
 import random
+import re
 import shutil
 import socket
 import struct
@@ -273,10 +274,13 @@ def cmd_setup_dns(addr: str):
     ))
     # Keep per-network DNS servers (DHCP) out of systemd-resolved, otherwise
     # it sends queries to them in parallel and they leak unencrypted.
+    # dns=none alone is not enough: systemd-resolved=true (the default) makes
+    # NetworkManager push connection DNS to resolved regardless of dns=.
     atomic_write(NM_DROPIN, (
         "# Managed by DNSCrypt UI: do not push DHCP DNS servers to systemd-resolved.\n"
         "[main]\n"
         "dns=none\n"
+        "systemd-resolved=false\n"
     ))
     # The drop-in from the old setup guide disabled the stub listener
     if LEGACY_RESOLVED_DROPIN.exists():
@@ -294,7 +298,10 @@ def cmd_setup_dns(addr: str):
         restorecon(RESOLV_CONF)
         changed_resolv = True
 
-    reload_network(clear_link_dns=True)
+    leftover = reload_network(clear_link_dns=True)
+    if leftover:
+        detail = "; ".join(f"{k}: {' '.join(v)}" for k, v in leftover.items())
+        raise HelperError(f"Settings were written, but these networks still have their own DNS servers: {detail}")
     return {
         "ok": True,
         "message": "System DNS now goes through dnscrypt-proxy",
@@ -314,24 +321,58 @@ def cmd_undo_dns():
     return {"ok": True, "message": "Restored the default network DNS setup", "removed": removed}
 
 
+def link_dns():
+    """{link name: [servers]} for non-loopback links, from resolvectl."""
+    res = run(["resolvectl", "dns"], timeout=10)
+    found = {}
+    for line in res.stdout.splitlines():
+        m = re.match(r"^Link \d+ \(([^)]+)\):\s*(.*)$", line.strip())
+        if m and m.group(1) != "lo" and m.group(2).strip():
+            found[m.group(1)] = m.group(2).split()
+    return found
+
+
+def revert_links():
+    for _index, name in socket.if_nameindex():
+        if name != "lo":
+            run(["resolvectl", "revert", name], timeout=10)
+
+
 def reload_network(clear_link_dns: bool):
     """
-    systemd-resolved keeps per-link DNS servers across restarts (in
-    /run/systemd/resolve/netif/), so restarting it does not drop the servers
-    NetworkManager pushed earlier. When routing through dnscrypt-proxy, clear
-    them explicitly with `resolvectl revert`; when undoing, ask NetworkManager
-    to push them again.
+    Apply the NetworkManager and systemd-resolved drop-ins.
+
+    systemd-resolved keeps per-link DNS servers across restarts, and
+    NetworkManager may keep pushing them until its config is re-read, so when
+    routing through dnscrypt-proxy clear them and verify, restarting
+    NetworkManager if they come back. Returns links that still have DNS.
     """
-    if shutil.which("nmcli"):
+    have_nm = bool(shutil.which("nmcli"))
+    if have_nm:
         run(["nmcli", "general", "reload", "conf"], timeout=30)
     run(["systemctl", "restart", "systemd-resolved"], timeout=30, check=True)
-    if clear_link_dns:
-        for _index, name in socket.if_nameindex():
-            if name != "lo":
-                run(["resolvectl", "revert", name], timeout=10)
-    if shutil.which("nmcli"):
+
+    if not clear_link_dns:
+        # Undo: make NetworkManager push connection DNS again
+        if have_nm:
+            run(["systemctl", "restart", "NetworkManager"], timeout=60)
+            time.sleep(3)
+        run(["resolvectl", "flush-caches"], timeout=10)
+        return {}
+
+    if have_nm:
         run(["nmcli", "general", "reload", "dns-full"], timeout=30)
+    revert_links()
+    time.sleep(1)
+    leftover = link_dns()
+    if leftover and have_nm:
+        run(["systemctl", "restart", "NetworkManager"], timeout=60)
+        time.sleep(3)
+        revert_links()
+        time.sleep(1)
+        leftover = link_dns()
     run(["resolvectl", "flush-caches"], timeout=10)
+    return leftover
 
 
 def main(argv):

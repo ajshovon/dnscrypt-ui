@@ -284,19 +284,55 @@ class HelperTests(unittest.TestCase):
         _, path = self.helper.validate_input({"toml": "server_names = []", "rules": ""})
         self.assertEqual(path, self.dir / "forwarding-rules.txt")
 
-    def test_reload_network_clears_link_dns_after_restart(self):
+    def _stub_network(self, dns_outputs):
         calls = []
-        self.helper.run = lambda argv, timeout=60, check=False: calls.append(argv)
-        self.helper.socket.if_nameindex = lambda: [(1, "lo"), (2, "enp4s0"), (3, "wlp5s0")]
-        self.helper.reload_network(clear_link_dns=True)
-        restart = calls.index(["systemctl", "restart", "systemd-resolved"])
-        reverts = [c for c in calls if c[:2] == ["resolvectl", "revert"]]
-        self.assertEqual(reverts, [["resolvectl", "revert", "enp4s0"], ["resolvectl", "revert", "wlp5s0"]])
-        self.assertTrue(all(calls.index(r) > restart for r in reverts))
+        outputs = iter(dns_outputs)
 
-        calls.clear()
+        def fake_run(argv, timeout=60, check=False):
+            calls.append(argv)
+            out = next(outputs) if argv == ["resolvectl", "dns"] else ""
+            return subprocess.CompletedProcess(argv, 0, out, "")
+
+        self.helper.run = fake_run
+        self.helper.time.sleep = lambda s: None
+        self.helper.socket.if_nameindex = lambda: [(1, "lo"), (2, "enp4s0"), (3, "wlp5s0")]
+        return calls
+
+    LEAKING = "Global: 127.0.0.1\nLink 2 (enp4s0): 192.168.31.1\nLink 3 (wlp5s0):\n"
+    CLEAN = "Global: 127.0.0.1\nLink 2 (enp4s0):\nLink 3 (wlp5s0):\n"
+
+    def test_link_dns_parser(self):
+        self._stub_network([self.LEAKING])
+        self.assertEqual(self.helper.link_dns(), {"enp4s0": ["192.168.31.1"]})
+
+    def test_setup_clears_link_dns_without_nm_restart_when_clean(self):
+        calls = self._stub_network([self.CLEAN])
+        self.assertEqual(self.helper.reload_network(clear_link_dns=True), {})
+        restart = calls.index(["systemctl", "restart", "systemd-resolved"])
+        reverts = [i for i, c in enumerate(calls) if c[:2] == ["resolvectl", "revert"]]
+        self.assertEqual([calls[i][2] for i in reverts], ["enp4s0", "wlp5s0"])
+        self.assertTrue(all(i > restart for i in reverts))
+        self.assertNotIn(["systemctl", "restart", "NetworkManager"], calls)
+
+    def test_setup_restarts_nm_when_dns_comes_back(self):
+        calls = self._stub_network([self.LEAKING, self.CLEAN])
+        self.assertEqual(self.helper.reload_network(clear_link_dns=True), {})
+        nm = calls.index(["systemctl", "restart", "NetworkManager"])
+        self.assertTrue(any(c[:2] == ["resolvectl", "revert"] for c in calls[nm:]))
+
+    def test_setup_reports_leftover(self):
+        self._stub_network([self.LEAKING, self.LEAKING])
+        self.assertEqual(self.helper.reload_network(clear_link_dns=True), {"enp4s0": ["192.168.31.1"]})
+
+    def test_undo_restarts_nm_and_does_not_revert(self):
+        calls = self._stub_network([])
         self.helper.reload_network(clear_link_dns=False)
+        self.assertIn(["systemctl", "restart", "NetworkManager"], calls)
         self.assertFalse(any(c[:2] == ["resolvectl", "revert"] for c in calls))
+
+    def test_nm_dropin_disables_resolved_push(self):
+        src = (ROOT / "helper" / "dnscrypt-ui-helper").read_text()
+        self.assertIn("systemd-resolved=false", src)
 
     def test_parse_addr(self):
         self.assertEqual(str(self.helper.parse_addr("127.0.0.1")[0]), "127.0.0.1")
