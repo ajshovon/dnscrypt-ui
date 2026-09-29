@@ -218,15 +218,35 @@ class ResolversView(Adw.PreferencesPage):
             badges.append(_badge("DNSSEC", "security"))
         if entry.get("nolog"):
             badges.append(_badge("No-log", "privacy"))
+        elif not entry.get("missing") and not entry.get("static"):
+            badges.append(_badge("May log", "warning"))
         if not entry.get("missing") and not entry.get("static"):
             badges.append(_badge("Unfiltered", "neutral") if entry.get("nofilter") else _badge("Filtering", "warning"))
         row.add_suffix(badges)
+
+        fix = None if entry.get("missing") or entry.get("static") else resolver_db.exclusion_fix(entry, self.cfg)
+        if fix and selected:
+            attr, value, label = fix
+            btn = Gtk.Button(label=label, valign=Gtk.Align.CENTER, margin_end=6)
+            btn.set_tooltip_text(
+                "Change this requirement for all resolvers. Only the resolvers you select are used, "
+                "so this does not add other servers unless none are selected."
+            )
+            btn.connect("clicked", lambda _b: self._apply_fix(attr, value))
+            row.add_suffix(btn)
 
         switch = Gtk.Switch(active=selected, valign=Gtk.Align.CENTER)
         switch.connect("notify::active", self._on_switch_toggled, name)
         row.add_suffix(switch)
         row.set_activatable_widget(switch)
         return row
+
+    def _apply_fix(self, attr: str, value: bool):
+        setattr(self.cfg, attr, value)
+        self.win.status_view.reload()
+        self.win.settings_view.reload()
+        self.win.config_changed()
+        self.win.show_toast("Requirement changed. Press Apply to use it")
 
     def _on_switch_toggled(self, switch, _pspec, name: str):
         self.cfg.toggle_resolver(name, switch.get_active())

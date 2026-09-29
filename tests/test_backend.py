@@ -248,6 +248,25 @@ class ResolverTests(unittest.TestCase):
         self.assertIn("DoH", resolver_db.exclusion_reason(self.ENTRY, cfg))
         self.assertIn("Not found", resolver_db.exclusion_reason(None, cfg))
 
+    def test_exclusion_fix(self):
+        cfg = make_cfg()
+        google = {"name": "google", "proto": "DoH", "ipv6": False, "dnssec": True, "nolog": False, "nofilter": True}
+        self.assertEqual(resolver_db.exclusion_fix(google, cfg)[:2], ("require_nolog", False))
+        cfg.require_nolog = False
+        self.assertIsNone(resolver_db.exclusion_fix(google, cfg))
+        self.assertIsNone(resolver_db.exclusion_reason(google, cfg))
+        cfg.doh_servers = False
+        self.assertEqual(resolver_db.exclusion_fix(google, cfg)[:2], ("doh_servers", True))
+        self.assertIsNone(resolver_db.exclusion_fix(None, cfg))
+
+    def test_allowing_loggers_writes_require_nolog_false(self):
+        cfg = make_cfg()
+        cfg.require_nolog = False
+        cfg.toggle_resolver("google", True)
+        parsed = tomllib.loads(cfg.generate_toml_content())
+        self.assertIs(parsed["require_nolog"], False)
+        self.assertIn("google", parsed["server_names"])
+
     def test_effective(self):
         cfg = make_cfg()
         catalog = [dict(self.ENTRY, name="cloudflare", nofilter=True)]

@@ -115,6 +115,32 @@ def exclusion_reason(entry: Optional[Dict], cfg) -> Optional[str]:
     return None
 
 
+def exclusion_fix(entry: Optional[Dict], cfg) -> Optional[tuple]:
+    """
+    The setting change that would stop dnscrypt-proxy skipping this server:
+    (config attribute, new value, button label), or None if it is usable or
+    cannot be fixed by a setting. Mirrors the order of exclusion_reason().
+    """
+    if entry is None:
+        return None
+    proto = entry["proto"]
+    if proto == "DoH" and not cfg.doh_servers:
+        return ("doh_servers", True, "Enable DoH")
+    if proto == "DNSCrypt" and not cfg.dnscrypt_servers:
+        return ("dnscrypt_servers", True, "Enable DNSCrypt")
+    if proto == "ODoH" and not cfg.odoh_servers:
+        return None
+    if entry["ipv6"] and not cfg.ipv6_servers:
+        return None
+    if cfg.require_dnssec and not entry["dnssec"]:
+        return ("require_dnssec", False, "Allow without DNSSEC")
+    if cfg.require_nolog and not entry["nolog"]:
+        return ("require_nolog", False, "Allow logging")
+    if cfg.require_nofilter and not entry["nofilter"]:
+        return ("require_nofilter", False, "Allow filtering")
+    return None
+
+
 def effective_servers(catalog: List[Dict], cfg) -> Optional[List[str]]:
     """
     Names dnscrypt-proxy will actually use. Returns None when server_names is
