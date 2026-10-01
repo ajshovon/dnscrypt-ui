@@ -1,5 +1,5 @@
 """
-Run with: python3 -m unittest discover -s tests -v   (from dns-crypt-ui/)
+Run with: python3 -m unittest discover -s tests -v   (from dnscrypt-ui/)
 """
 
 import hashlib

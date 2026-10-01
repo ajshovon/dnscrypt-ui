@@ -11,6 +11,25 @@ Pairs with the [DNSCrypt Indicator](https://github.com/ajshovon/gnome-dnscrypt-i
 - **Query Log**: live view of dnscrypt-proxy's query log with blocked/error highlighting.
 - **Safe apply**: changes are validated with `dnscrypt-proxy -check`, backed up, and rolled back automatically if the service does not come up.
 
+## Screenshots
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/dnscrypt-ui-status-dark.png">
+  <img src="screenshots/dnscrypt-ui-status-light.png" alt="Dashboard: service status, DNS leak protection, resolution test, summary">
+</picture>
+
+<p>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/dnscrypt-ui-rules-dark.png">
+  <img src="screenshots/dnscrypt-ui-rules-light.png" alt="Domain Rules: split DNS per domain" width="490">
+</picture>
+  <picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/dnscrypt-ui-resolvers-dark.png">
+  <img src="screenshots/dnscrypt-ui-resolvers-light.png" alt="Resolvers: pick encrypted DoH / DNSCrypt upstreams" width="490">
+</picture>
+</p>
+
+
 ## Install
 
 ```bash

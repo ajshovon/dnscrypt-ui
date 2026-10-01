@@ -79,7 +79,7 @@ class SettingsView(Adw.PreferencesPage):
             helper_row.set_subtitle("Installed with its own polkit action")
             helper_row.add_prefix(Gtk.Image.new_from_icon_name("object-select-symbolic"))
         elif helper_status == "outdated":
-            helper_row.set_subtitle("Out of date: run ./install.sh in the dns-crypt-ui folder to update it")
+            helper_row.set_subtitle("Out of date: run ./install.sh in the dnscrypt-ui folder to update it")
             helper_row.add_prefix(Gtk.Image.new_from_icon_name("dialog-warning-symbolic"))
         else:
             helper_row.set_subtitle(

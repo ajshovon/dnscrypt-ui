@@ -177,7 +177,7 @@ class ServiceManager:
             return {
                 "ok": False,
                 "message": "The installed privileged helper is from an older version of DNSCrypt UI. "
-                           "Run ./install.sh in the dns-crypt-ui folder to update it.",
+                           "Run ./install.sh in the dnscrypt-ui folder to update it.",
             }
         if status == "installed":
             argv = ["pkexec", str(INSTALLED_HELPER)]
