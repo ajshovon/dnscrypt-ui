@@ -2,6 +2,8 @@
 
 A GNOME / Libadwaita interface for **`dnscrypt-proxy`** on Fedora and other Linux distributions.
 
+Pairs with the [DNSCrypt Indicator](https://github.com/ajshovon/gnome-dnscrypt-indicator) GNOME Shell extension for a top-bar status icon and quick switch.
+
 - **System DNS protection**: checks that every application actually resolves through dnscrypt-proxy (no leaks to DHCP/router DNS), and fixes it in one click.
 - **Encrypted DNS switch**: turning it off gives system DNS back to your network and then stops dnscrypt-proxy, so you are never left without DNS. Turning it on reverses that.
 - **Resolvers**: pick encrypted DoH / DNSCrypt upstreams from the list dnscrypt-proxy itself loads, see why a server would be skipped (missing, disabled, or protocol turned off), or add your own `sdns://` stamp.
@@ -13,7 +15,8 @@ A GNOME / Libadwaita interface for **`dnscrypt-proxy`** on Fedora and other Linu
 
 ```bash
 sudo dnf install dnscrypt-proxy
-cd dns-crypt-ui
+git clone https://github.com/ajshovon/dnscrypt-ui.git
+cd dnscrypt-ui
 ./install.sh          # user install + root-owned helper and polkit action (asks for sudo)
 ./install.sh --user-only   # skip the helper (the app then runs it from this folder)
 ```
@@ -75,7 +78,7 @@ Domain Rules use dnscrypt-proxy's `forwarding_rules`, which can only forward to 
 ## Project structure
 
 ```text
-dns-crypt-ui/
+dnscrypt-ui/
 ├── bin/dnscrypt-ui                 # launcher
 ├── helper/dnscrypt-ui-helper       # privileged helper (standalone, runs as root)
 ├── data/                           # desktop entry, icon, polkit policy
@@ -91,3 +94,7 @@ dns-crypt-ui/
 │   └── views/                      # Dashboard, Domain Rules, Resolvers, Query Log, Settings
 └── tests/test_backend.py
 ```
+
+## License
+
+[GPL-3.0-or-later](LICENSE)
